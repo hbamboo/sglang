@@ -498,6 +498,7 @@ class Sampler(nn.Module):
                 sampling_info.need_min_p_sampling,
                 sampling_info.sampling_seed,
                 positions,
+                npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
             )
             return batch_next_token_ids.to(torch.int32)
 
@@ -657,6 +658,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     need_min_p_sampling: bool,
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
+    npu_top_k_top_p_eligible: bool = False,
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
@@ -666,7 +668,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     if (
         top_ks is not None
         and hasattr(torch_npu, "npu_top_k_top_p")
-        and torch.all((top_ks <= 1024) & (top_ks >= 1))
+        and npu_top_k_top_p_eligible
     ):
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
