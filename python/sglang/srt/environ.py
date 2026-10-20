@@ -745,6 +745,9 @@ class Envs:
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+    # Use the Ascend FlashAttn op (cann_ops_transformer.flash_attn) instead of
+    # FusedInferAttentionScore on Ascend 950PR/950DT. See flash_attn_adapter.py.
+    ENABLE_ASCEND_FLASH_ATTN = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
