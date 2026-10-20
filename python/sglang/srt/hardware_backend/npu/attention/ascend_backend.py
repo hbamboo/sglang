@@ -398,6 +398,11 @@ class AscendAttnBackend(AttentionBackend):
         # _fa_metadata_for). Populated on the warmup calls that precede
         # NPUGraph capture, so the tensors never live in the graph pool.
         self._fa_meta_cache = {}
+        # Metadata is only valid for the tensors it was built from, so eager
+        # paths rebuild it once per scheduler step (all layers of a step pass
+        # identical arguments, so sharing within the step is consistent).
+        self._fa_step_id = 0
+        self._fa_step_meta = {}
         # Prefill metadata is keyed by per-step batch shape (not captured in a
         # graph), so keep it bounded: unbounded growth churns device memory on
         # every step and fragments the pool.
@@ -575,6 +580,9 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        # New step: drop the previous step's FlashAttn metadata.
+        self._fa_step_id += 1
+        self._fa_step_meta.clear()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -724,10 +732,10 @@ class AscendAttnBackend(AttentionBackend):
             num_kv_heads,
             head_dim,
         )
-        if prefill:
-            md = self._fa_prefill_cache.get(key)
-        else:
-            md = self._fa_meta_cache.get(key)
+        # Documented contract: metadata must describe the very tensors passed to
+        # flash_attn.  Keyed by the step id => always fresh per step, never
+        # reused across steps.
+        md = self._fa_step_meta.get(key)
         if md is None:
             md = fa_adapter.metadata(
                 num_q_heads,
@@ -741,14 +749,7 @@ class AscendAttnBackend(AttentionBackend):
                 mask_mode=mask_mode,
                 layout_q=layout,
             )
-            if prefill:
-                self._fa_prefill_cache[key] = md
-                self._fa_prefill_cache_order.append(key)
-                while len(self._fa_prefill_cache_order) > self._fa_prefill_cache_max:
-                    old = self._fa_prefill_cache_order.pop(0)
-                    self._fa_prefill_cache.pop(old, None)
-            else:
-                self._fa_meta_cache[key] = md
+            self._fa_step_meta[key] = md
         return md
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -1616,18 +1617,16 @@ class AscendAttnBackend(AttentionBackend):
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 # max_seqlen_kv must not exceed what block_tables can index:
                 # the table is only ceil(batch_max_len / page_size) wide.
-                # Round the upper bounds up to a coarse bucket: still a safe
-                # upper bound for the operator, but keeps the metadata cache
-                # key stable instead of allocating a fresh tensor every step.
-                fa_max_kv = _fa_bucket(
-                    self.forward_metadata.block_tables.shape[-1] * self.page_size
-                )
+                # Doc: max_seqlen_* must equal the real maximum.  -1 means
+                # "unspecified": the operator derives it from the actual tensors,
+                # so it can never disagree with them.
+                fa_max_kv = -1
                 # Right-size max_seqlen_q: passing max_context_len makes the
                 # operator size its workspace/descriptor for 32768 tokens even
                 # for a much shorter chunk, which under mem-fraction 0.9 leaves
                 # the MIX descriptor buffer unbuildable (plog: descAlignBuf is
                 # invalid). Use the real batch maximum instead.
-                fa_max_q = _fa_bucket(int(max(forward_batch.extend_seq_lens_cpu)))
+                fa_max_q = -1
                 fa_cu_seqlens_q = self.forward_metadata.fa_cu_seqlens_q
                 fa_seqused_kv = self.forward_metadata.seq_lens
                 fa_md = self._fa_metadata_for(
@@ -2671,23 +2670,26 @@ class AscendAttnBackend(AttentionBackend):
                 # graph metadata step refills in place, so this call is
                 # graph-safe without an NPUGraph.update() channel.
                 fa_bs = block_tables.shape[0]
-                fa_max_kv = self.max_context_len
+                fa_max_kv = -1
                 fa_seqused_kv = self.forward_metadata.fa_seqused_kv
                 if fa_seqused_kv is None:
                     # Not captured yet (pure eager fallback path).
                     fa_seqused_kv = self.forward_metadata.seq_lens[
                         :fa_bs
                     ].clamp(min=1)
-                fa_md = self._fa_metadata_for(
-                    bs=fa_bs,
-                    layout="BSND",
-                    mask_mode=0,
+                # Built inside the captured graph: every replay recomputes it
+                # from the same (in-place updated) tensors, so metadata and the
+                # operator arguments stay consistent by construction.
+                fa_md = fa_adapter.metadata(
+                    layer.tp_q_head_num,
+                    layer.tp_k_head_num,
+                    layer.qk_head_dim,
+                    batch_size=fa_bs,
                     max_seqlen_q=1,
                     max_seqlen_kv=fa_max_kv,
-                    num_q_heads=layer.tp_q_head_num,
-                    num_kv_heads=layer.tp_k_head_num,
-                    head_dim=layer.qk_head_dim,
                     seqused_kv=fa_seqused_kv,
+                    mask_mode=0,
+                    layout_q="BSND",
                 )
                 attn_output = fa_adapter.decode(
                     query.view(
@@ -2983,15 +2985,8 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 actual_bs = self.forward_metadata.block_tables.shape[0]
                 seqused_kv = self.forward_metadata.seq_lens[:actual_bs]
-                if self.forward_metadata.seq_lens_cpu_int is not None:
-                    max_seqlen_kv = int(
-                        self.forward_metadata.seq_lens_cpu_int[:actual_bs].max()
-                    )
-                else:
-                    max_seqlen_kv = (
-                        self.forward_metadata.block_tables.shape[-1]
-                        * self.page_size
-                    )
+                # Doc: must equal the real max; -1 = derive from the tensors.
+                max_seqlen_kv = -1
                 fa_md = self._fa_metadata_for(
                     bs=actual_bs,
                     layout="BSND",
