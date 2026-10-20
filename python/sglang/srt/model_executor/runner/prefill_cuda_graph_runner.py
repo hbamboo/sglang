@@ -1592,16 +1592,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # MIXED replays the EXTEND-captured graphs.
-        pcg_forward_mode = (
-            ForwardMode.EXTEND
-            if forward_batch.forward_mode == ForwardMode.MIXED
-            else forward_batch.forward_mode
-        )
-        pcg_global_forward_mode = (
-            ForwardMode.EXTEND
-            if forward_batch.global_forward_mode == ForwardMode.MIXED
-            else forward_batch.global_forward_mode
-        )
+        # On CUDA a MIXED batch is run as EXTEND (decode tails are 1-token
+        # extends). On NPU, MIXED must stay MIXED so the attention dispatch in
+        # base_attn_backend keeps routing to the dedicated mixed kernel
+        # (forward_mixed / mix_mask) that is the only correct path for a batch
+        # mixing prefill and decode tails.
+        if is_npu() and forward_batch.forward_mode == ForwardMode.MIXED:
+            pcg_forward_mode = ForwardMode.MIXED
+            pcg_global_forward_mode = forward_batch.global_forward_mode
+        else:
+            pcg_forward_mode = (
+                ForwardMode.EXTEND
+                if forward_batch.forward_mode == ForwardMode.MIXED
+                else forward_batch.forward_mode
+            )
+            pcg_global_forward_mode = (
+                ForwardMode.EXTEND
+                if forward_batch.global_forward_mode == ForwardMode.MIXED
+                else forward_batch.global_forward_mode
+            )
 
         # The draft tail concatenates hidden states with padded input embeddings;
         # expose the bucket-sized static view and refresh its live prefix below.

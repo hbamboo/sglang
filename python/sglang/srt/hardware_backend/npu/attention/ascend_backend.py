@@ -87,6 +87,9 @@ class ForwardMetadata:
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_list: Optional[List[int]] = None
+    # Host int list mirror of seq_lens_cpu_int, computed once per step and
+    # reused by every layer's attention call (see _get_seq_lens_cpu_int_list).
+    seq_lens_cpu_int_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
@@ -418,6 +421,25 @@ class AscendAttnBackend(AttentionBackend):
     ):
         pass
 
+    def _get_seq_lens_cpu_int_list(self) -> Optional[List[int]]:
+        """Host int list of per-request KV seq lens for FIA/FISA calls.
+
+        torch_npu's FIA/FISA binding re-converts tensor arguments to host int
+        arrays element-by-element (aten::unbind + aten::item per request) on
+        every call. Under breakable-graph prefill replay the attention op runs
+        eagerly once per layer, so passing a tensor turns that into
+        num_layers * batch_size blocking conversions per step. Prefer the
+        per-step precomputed list (see init_forward_metadata); fall back to a
+        one-off conversion when the metadata was built without it (e.g. by the
+        graph-capture helpers).
+        """
+        md = self.forward_metadata
+        if md.seq_lens_cpu_int_list is not None:
+            return md.seq_lens_cpu_int_list
+        if md.seq_lens_cpu_int is not None:
+            return md.seq_lens_cpu_int.cpu().int().tolist()
+        return md.seq_lens_cpu_list
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -512,6 +534,16 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+
+        # Precompute the host int list once per step (after any speculative
+        # adjustment above) so that per-layer FIA/FISA calls can pass a plain
+        # python list instead of a tensor. This removes the binding's
+        # per-request aten::unbind + aten::item conversions from the hot
+        # per-layer path (breakable-graph prefill replay).
+        if self.forward_metadata.seq_lens_cpu_int is not None:
+            self.forward_metadata.seq_lens_cpu_int_list = (
+                self.forward_metadata.seq_lens_cpu_int.tolist()
+            )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -1312,7 +1344,7 @@ class AscendAttnBackend(AttentionBackend):
                             num_query_heads=layer.tp_q_head_num,
                             num_key_value_heads=layer.tp_k_head_num,
                             actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
-                            actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
+                            actual_seq_kvlen=self._get_seq_lens_cpu_int_list(),
                             softmax_scale=layer.scaling,
                             sparse_mode=4 if layer.sliding_window_size != -1 else 3,
                             learnable_sink=sinks,
@@ -1431,7 +1463,7 @@ class AscendAttnBackend(AttentionBackend):
                         atten_mask=self.fia_mask,
                         input_layout="TND",
                         actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                        actual_seq_lengths_kv=self._get_seq_lens_cpu_int_list(),
                         num_key_value_heads=layer.tp_k_head_num,
                         num_heads=layer.tp_q_head_num,
                         scale=layer.scaling,
@@ -2924,9 +2956,22 @@ class AscendAttnBackend(AttentionBackend):
             )
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        num_block, block_size, _, _ = k_cache.shape
-        key = k_cache.view(num_block, block_size, -1)
-        value = v_cache.view(num_block, block_size, -1)
+        if self.use_fia:
+            # ASCEND_USE_FIA=1 lays the KV cache out token-major as
+            # [num_pages * page_size, 1, H, D] (see
+            # NPUMHATokenToKVPool._create_buffers), so dim 1 is 1, not the page
+            # size. FIA's block_size must be the real page size (a multiple of
+            # 16 in [16, 1024]), so view the buffer back to page-major exactly
+            # like forward_extend does.
+            block_size = self.page_size
+            key = k_cache.view(-1, block_size, layer.tp_k_head_num * layer.qk_head_dim)
+            value = v_cache.view(
+                -1, block_size, layer.tp_v_head_num * layer.v_head_dim
+            )
+        else:
+            num_block, block_size, _, _ = k_cache.shape
+            key = k_cache.view(num_block, block_size, -1)
+            value = v_cache.view(num_block, block_size, -1)
 
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
@@ -2942,7 +2987,7 @@ class AscendAttnBackend(AttentionBackend):
             atten_mask=self.mix_mask,
             sparse_mode=3,
             actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+            actual_seq_lengths_kv=self._get_seq_lens_cpu_int_list(),
             scale=layer.scaling,
         )
 

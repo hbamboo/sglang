@@ -123,7 +123,7 @@ def forward_mha_prepare_npu(
     kv = m.kv_b_proj(kv_a)[0]
     kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
     k_nope = kv[..., : m.qk_nope_head_dim]
-    v = kv[..., m.qk_nope_head_dim :]
+    v = kv[..., m.qk_nope_head_dim :].contiguous()
 
     k = m._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
     return q, k, v, forward_batch
