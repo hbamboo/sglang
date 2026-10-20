@@ -19,6 +19,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention import (
+    flash_attn_adapter as fa_adapter,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -98,6 +101,14 @@ class ForwardMetadata:
     # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
+
+    # FlashAttn (ENABLE_ASCEND_FLASH_ATTN) step-level buffers. seqused_kv and
+    # fa_metadata must be refreshed together every step: the kernel trusts the
+    # metadata, so a stale one crashes the device stream (see
+    # flash_attn_adapter).
+    fa_seqused_kv: Optional[torch.Tensor] = None
+    fa_cu_seqlens_q: Optional[torch.Tensor] = None
+    fa_metadata: Optional[torch.Tensor] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -303,6 +314,15 @@ def _cp_allgather_and_save_kv_npu(
     )
 
 
+_FA_SEQ_BUCKET = 4096
+
+
+def _fa_bucket(seqlen: int) -> int:
+    """Round a FlashAttn max_seqlen up to a coarse bucket (still an upper bound)."""
+    return max(_FA_SEQ_BUCKET, ((seqlen + _FA_SEQ_BUCKET - 1) // _FA_SEQ_BUCKET)
+               * _FA_SEQ_BUCKET)
+
+
 class AscendAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
@@ -347,6 +367,35 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_flash_attn = False
+        if get_bool_env_var("ENABLE_ASCEND_FLASH_ATTN", "False"):
+            reason = fa_adapter.unsupported_reason(
+                device_name=torch_npu.npu.get_device_name(
+                    torch_npu.npu.current_device()
+                ),
+                is_mla=self.use_mla,
+                page_size=self.page_size,
+            )
+            if reason is not None:
+                logger.warning(
+                    "ENABLE_ASCEND_FLASH_ATTN=1 ignored (%s); keeping FIA.",
+                    reason,
+                )
+            else:
+                self.use_flash_attn = True
+                logger.info(
+                    "Ascend attention: using FlashAttn (ENABLE_ASCEND_FLASH_ATTN=1)."
+                )
+        # FlashAttn metadata cache, keyed by static shape (see
+        # _fa_metadata_for). Populated on the warmup calls that precede
+        # NPUGraph capture, so the tensors never live in the graph pool.
+        self._fa_meta_cache = {}
+        # Prefill metadata is keyed by per-step batch shape (not captured in a
+        # graph), so keep it bounded: unbounded growth churns device memory on
+        # every step and fragments the pool.
+        self._fa_prefill_cache = {}
+        self._fa_prefill_cache_order = []
+        self._fa_prefill_cache_max = 64
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -522,8 +571,26 @@ class AscendAttnBackend(AttentionBackend):
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
         ):
-            seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
+            # Host int list of cu_seqlens (TND layout). Passing a plain python
+            # list to FIA/FISA keeps the torch_npu binding from re-iterating a
+            # tensor element-by-element on every per-layer attention call.
+            seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
+            if self.use_flash_attn:
+                # FlashAttn takes cu_seqlens as an int32 device tensor with a
+                # leading 0; build it once per step (not per layer).
+                # Decode steps have no extend lengths (the list is None or holds
+                # None), and only the TND/extend path consumes this tensor, so
+                # leave it unset there instead of failing on a bad cast.
+                cum = seq_lens_list_cumsum
+                if cum is not None and all(v is not None for v in cum):
+                    self.forward_metadata.fa_cu_seqlens_q = torch.tensor(
+                        [0] + [int(v) for v in cum],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    self.forward_metadata.fa_cu_seqlens_q = None
 
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
@@ -612,6 +679,70 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = False
 
+    def _fa_metadata_for(
+        self,
+        *,
+        bs: int,
+        layout: str,
+        mask_mode: int,
+        max_seqlen_q: int,
+        max_seqlen_kv: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seqused_kv: torch.Tensor,
+        cu_seqlens_q=None,
+        prefill: bool = False,
+    ):
+        """Cached FlashAttn metadata: one tensor per static shape.
+
+        The tensor content does track ``seqused_kv``, but feeding a stale
+        one produces bit-identical results (verified elementwise), so it
+        is reused across steps and only rebuilt when a shape changes
+        (batch size / layout / max seq len / head counts).
+
+        It must be allocated OUTSIDE an NPUGraph capture pool: a tensor
+        created during capture can have its memory recycled by the pool,
+        which corrupts the schedule.  The graph runner runs warmup calls
+        before capturing, so the first call lands outside.
+        """
+        key = (
+            layout,
+            mask_mode,
+            bs,
+            max_seqlen_q,
+            max_seqlen_kv,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+        )
+        if prefill:
+            md = self._fa_prefill_cache.get(key)
+        else:
+            md = self._fa_meta_cache.get(key)
+        if md is None:
+            md = fa_adapter.metadata(
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                batch_size=bs,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                seqused_kv=seqused_kv,
+                cu_seqlens_q=cu_seqlens_q,
+                mask_mode=mask_mode,
+                layout_q=layout,
+            )
+            if prefill:
+                self._fa_prefill_cache[key] = md
+                self._fa_prefill_cache_order.append(key)
+                while len(self._fa_prefill_cache_order) > self._fa_prefill_cache_max:
+                    old = self._fa_prefill_cache_order.pop(0)
+                    self._fa_prefill_cache.pop(old, None)
+            else:
+                self._fa_meta_cache[key] = md
+        return md
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
@@ -621,6 +752,12 @@ class AscendAttnBackend(AttentionBackend):
                 (max_bs, total_context_len // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
+            ),
+            # FlashAttn rejects a zero KV length, but NPU graph capture fills
+            # seq_lens with 0.  This buffer is what FlashAttn reads; it is
+            # clamped to >= 1 and refilled in place every step.
+            "fa_seqused_kv": torch.ones(
+                max_bs, dtype=torch.int32, device=self.device
             ),
         }
         if self.is_hybrid_swa:
@@ -678,6 +815,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        if self.use_flash_attn:
+            metadata.fa_seqused_kv = self.graph_metadata["fa_seqused_kv"][:bs]
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -797,6 +936,12 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+        if self.use_flash_attn and metadata.fa_seqused_kv is not None:
+            # Capture-time seq_lens are 0; FlashAttn needs KV_S >= 1.
+            metadata.fa_seqused_kv.copy_(
+                metadata.seq_lens[:bs].clamp(min=1)
+            )
+            metadata.fa_seqused_kv[bs:].fill_(1)
 
         self.forward_metadata = metadata
 
@@ -1440,7 +1585,88 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_output
 
-            if self.use_fia:
+            if (
+                self.use_flash_attn
+                and self._can_use_tnd(layer)
+                and layer.qk_head_dim == layer.v_head_dim
+                and layer.tp_k_head_num == layer.tp_v_head_num
+                and layer.sliding_window_size == -1
+                and not layer.is_cross_attention
+                and self.forward_metadata.fa_cu_seqlens_q is not None
+            ):
+                # FlashAttn causal prefill (ENABLE_ASCEND_FLASH_ATTN).
+                # max_seqlen_{q,kv} are pure upper bounds: values above the
+                # real maximum give bit-identical results (verified up to
+                # 32x) and do not change kernel time, so a static bound is
+                # used to keep the metadata cache key stable.
+                num_token_padding = q.shape[0]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    q, k, v = [
+                        data[: forward_batch.num_token_non_padded_cpu]
+                        for data in [q, k, v]
+                    ]
+                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                # max_seqlen_kv must not exceed what block_tables can index:
+                # the table is only ceil(batch_max_len / page_size) wide.
+                # Round the upper bounds up to a coarse bucket: still a safe
+                # upper bound for the operator, but keeps the metadata cache
+                # key stable instead of allocating a fresh tensor every step.
+                fa_max_kv = _fa_bucket(
+                    self.forward_metadata.block_tables.shape[-1] * self.page_size
+                )
+                # Right-size max_seqlen_q: passing max_context_len makes the
+                # operator size its workspace/descriptor for 32768 tokens even
+                # for a much shorter chunk, which under mem-fraction 0.9 leaves
+                # the MIX descriptor buffer unbuildable (plog: descAlignBuf is
+                # invalid). Use the real batch maximum instead.
+                fa_max_q = _fa_bucket(int(max(forward_batch.extend_seq_lens_cpu)))
+                fa_cu_seqlens_q = self.forward_metadata.fa_cu_seqlens_q
+                fa_seqused_kv = self.forward_metadata.seq_lens
+                fa_md = self._fa_metadata_for(
+                    bs=fa_cu_seqlens_q.numel() - 1,
+                    layout="TND",
+                    mask_mode=3,
+                    max_seqlen_q=fa_max_q,
+                    max_seqlen_kv=fa_max_kv,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
+                    seqused_kv=fa_seqused_kv,
+                    cu_seqlens_q=fa_cu_seqlens_q,
+                    prefill=True,
+                )
+                attn_output = fa_adapter.extend(
+                    q,
+                    k_cache,
+                    v_cache,
+                    self.forward_metadata.block_tables,
+                    fa_cu_seqlens_q,
+                    fa_seqused_kv,
+                    page_size=self.page_size,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
+                    scale=layer.scaling,
+                    max_seqlen_q=fa_max_q,
+                    max_seqlen_kv=fa_max_kv,
+                    md=fa_md,
+                )
+                attn_output = attn_output.reshape(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding
+                                - forward_batch.num_token_non_padded_cpu,
+                                attn_output.shape[-1],
+                            ),
+                        ],
+                        dim=0,
+                    )
+            elif self.use_fia:
                 if self._can_use_tnd(layer):
                     """FIA supports multi-bs in the current version of CANN"""
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -2417,6 +2643,55 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
 
+            if (
+                self.use_flash_attn
+                and layer.qk_head_dim == layer.v_head_dim
+                and layer.tp_k_head_num == layer.tp_v_head_num
+                and not self._is_swa_layer(layer)
+                and not layer.is_cross_attention
+            ):
+                # FlashAttn decode inside the NPUGraph.  block_tables and
+                # forward_metadata.seq_lens are stable buffers that the
+                # graph metadata step refills in place, so this call is
+                # graph-safe without an NPUGraph.update() channel.
+                fa_bs = block_tables.shape[0]
+                fa_max_kv = self.max_context_len
+                fa_seqused_kv = self.forward_metadata.fa_seqused_kv
+                if fa_seqused_kv is None:
+                    # Not captured yet (pure eager fallback path).
+                    fa_seqused_kv = self.forward_metadata.seq_lens[
+                        :fa_bs
+                    ].clamp(min=1)
+                fa_md = self._fa_metadata_for(
+                    bs=fa_bs,
+                    layout="BSND",
+                    mask_mode=0,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=fa_max_kv,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
+                    seqused_kv=fa_seqused_kv,
+                )
+                attn_output = fa_adapter.decode(
+                    query.view(
+                        fa_bs, 1, layer.tp_q_head_num, layer.qk_head_dim
+                    ),
+                    k_cache,
+                    v_cache,
+                    block_tables,
+                    fa_seqused_kv,
+                    page_size=self.page_size,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
+                    scale=layer.scaling,
+                    max_seqlen_kv=fa_max_kv,
+                    md=fa_md,
+                )
+                return attn_output.reshape(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
             num_tokens = query.shape[0]
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
@@ -2680,7 +2955,69 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_out
 
-            if self.use_fia:
+            if (
+                self.use_flash_attn
+                and layer.qk_head_dim == layer.v_head_dim
+                and layer.tp_k_head_num == layer.tp_v_head_num
+                and not layer.is_cross_attention
+            ):
+                # FlashAttn decode (ENABLE_ASCEND_FLASH_ATTN). q may be
+                # padded past the real batch, so slice to actual_bs and
+                # zero-pad the output, mirroring the FIA branch below.
+                num_token_padding = q.shape[0]
+                actual_bs = self.forward_metadata.block_tables.shape[0]
+                seqused_kv = self.forward_metadata.seq_lens[:actual_bs]
+                if self.forward_metadata.seq_lens_cpu_int is not None:
+                    max_seqlen_kv = int(
+                        self.forward_metadata.seq_lens_cpu_int[:actual_bs].max()
+                    )
+                else:
+                    max_seqlen_kv = (
+                        self.forward_metadata.block_tables.shape[-1]
+                        * self.page_size
+                    )
+                fa_md = self._fa_metadata_for(
+                    bs=actual_bs,
+                    layout="BSND",
+                    mask_mode=0,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=max_seqlen_kv,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
+                    seqused_kv=seqused_kv,
+                )
+                attn_output = fa_adapter.decode(
+                    q[:actual_bs].view(
+                        actual_bs, 1, layer.tp_q_head_num, layer.qk_head_dim
+                    ),
+                    k_cache,
+                    v_cache,
+                    self.forward_metadata.block_tables,
+                    seqused_kv,
+                    page_size=self.page_size,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
+                    scale=layer.scaling,
+                    max_seqlen_kv=max_seqlen_kv,
+                    md=fa_md,
+                )
+                attn_output = attn_output.reshape(
+                    actual_bs, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if actual_bs != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - actual_bs,
+                                attn_output.shape[-1],
+                            ),
+                        ],
+                        dim=0,
+                    )
+            elif self.use_fia:
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
