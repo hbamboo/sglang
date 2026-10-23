@@ -43,6 +43,10 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_qkv_norm_rope_opt = _is_npu and get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
+_use_qkv_norm_rope_decode = _use_qkv_norm_rope_opt and get_bool_env_var(
+    "ENABLE_QKV_NORM_ROPE_OPT_DECODE"
+)
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:
@@ -203,6 +207,47 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
+    def forward_prepare_npu_qkv_fused(self, positions, hidden_states, forward_batch):
+        """ENABLE_QKV_NORM_ROPE_OPT=1: split + RMSNorm + RoPE + PA-NZ KV 写回一次完成。
+
+        融合算子直接写 paged KV cache（PA_NZ 物理布局），因此调用方必须传
+        save_kv_cache=False，避免 attention 再写一遍。
+        """
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn.layer_id == self.start_layer:
+            self.rotary_emb.get_cos_sin_with_position(positions)
+
+        num_tokens = qkv.shape[0]
+        head_dim = self.head_dim
+        d1 = head_dim // 16
+        kv_pool = get_token_to_kv_pool()
+        page_size = kv_pool.page_size
+        k_cache, v_cache = kv_pool.get_kv_buffer(self.attn.layer_id)
+        k_cache = k_cache.view(-1, self.num_kv_heads * d1, page_size, 16)
+        v_cache = v_cache.view(-1, self.num_kv_heads * d1, page_size, 16)
+
+        index = forward_batch.out_cache_loc
+        if index.dtype != torch.int64:
+            index = index.to(torch.int64)
+
+        q_out = torch.empty(num_tokens, self.q_size, dtype=qkv.dtype, device=qkv.device)
+        torch.ops.npu.qkv_rms_norm_rope_cache(
+            qkv.view(num_tokens, -1),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.position_cos.view(num_tokens, head_dim),
+            self.rotary_emb.position_sin.view(num_tokens, head_dim),
+            index,
+            q_out,
+            k_cache,
+            v_cache,
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_kv_heads,
+            float(self.q_norm.variance_epsilon),
+        )
+        return q_out, None, None
+
     def forward_prepare_aiter_fused_mrope(
         self, positions, hidden_states, forward_batch
     ):
@@ -281,8 +326,27 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
         )
 
+        # 只在 prefill/extend 用融合算子: decode 保留原 Triton 路径, 以继续使用 ACL graph。
+        # 原因见交付报告: 融合算子的 tiling 每次 H2D 拷贝, 被 graph 捕获后 replay 会读到
+        # 陈旧 tiling(多 graph/不同 batch 时), 导致 aivec 越界; 该问题属于算子 host 侧实现,
+        # 本次不改算子, 因此 decode 不用它。
+        use_qkv_norm_rope = (
+            _use_qkv_norm_rope_opt
+            and self.head_dim == 128
+            and hidden_states.dtype == torch.bfloat16
+            and (
+                forward_batch.forward_mode.is_extend()
+                or _use_qkv_norm_rope_decode
+            )
+        )
+
         if use_aiter_fused:
             q, k, v = self.forward_prepare_aiter_fused_mrope(
+                positions, hidden_states, forward_batch
+            )
+            save_kv_cache = False
+        elif use_qkv_norm_rope:
+            q, k, v = self.forward_prepare_npu_qkv_fused(
                 positions, hidden_states, forward_batch
             )
             save_kv_cache = False

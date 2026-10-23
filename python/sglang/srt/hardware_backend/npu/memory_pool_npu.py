@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 if is_npu():
     import torch_npu
 
+# ENABLE_QKV_NORM_ROPE_OPT: KV cache 物理布局为 PA_NZ [page, head, D/16, slot, 16]
+_USE_QKV_NORM_ROPE_OPT = get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
+
 
 def _init_npu_conv_state(
     conv_state_in,
@@ -235,6 +238,23 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # the singleton FIA layout axis and scatter through an equivalent
             # 3-D view; the underlying KV storage and attention layout stay
             # unchanged.
+            if _USE_QKV_NORM_ROPE_OPT:
+                # PA_NZ 布局: [page, head, D/16, slot, 16]，用 CANN 的 paged-cache scatter 写
+                torch_npu.npu_scatter_pa_kv_cache(
+                    key=cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
+                    value=cache_v.contiguous().view(
+                        num_rows, self.head_num, self.v_head_dim
+                    ),
+                    key_cache=k_buffer_layer.view(
+                        -1, self.head_num * self.head_dim // 16, self.page_size, 16
+                    ),
+                    value_cache=v_buffer_layer.view(
+                        -1, self.head_num * self.v_head_dim // 16, self.page_size, 16
+                    ),
+                    slot_mapping=loc.to(torch.int32),
+                )
+                return
+
             loc_indices = loc.contiguous().view(-1, 1)
             torch_npu.npu_scatter_nd_update_(
                 k_buffer_layer.view(-1, self.head_num, self.head_dim),

@@ -43,10 +43,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 import logging
+from functools import lru_cache
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def is_qkv_norm_rope_opt() -> bool:
+    """ENABLE_QKV_NORM_ROPE_OPT: KV cache 由 qkv_rms_norm_rope_cache 按 PA_NZ 布局写入。"""
+    return get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
+
 FULL_ATTENTION_WINDOW = 2147483647
 
 
@@ -1050,12 +1058,12 @@ class AscendAttnBackend(AttentionBackend):
             q[split:].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         )
 
-        k_cache_paged = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-        )
-        v_cache_paged = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-        )
+        k_cache_paged = k_cache.view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim))
+        v_cache_paged = v_cache.view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim))
 
         attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_prev,
@@ -1452,12 +1460,12 @@ class AscendAttnBackend(AttentionBackend):
                         ]
                     attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                         query=q,
-                        key=k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                        ),
-                        value=v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-                        ),
+                        key=k_cache.view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)),
+                        value=v_cache.view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)),
                         block_table=self.forward_metadata.block_tables,
                         block_size=self.page_size,
                         atten_mask=self.fia_mask,
@@ -1988,8 +1996,12 @@ class AscendAttnBackend(AttentionBackend):
 
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query,
-            k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
-            v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
+            k_cache.view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)),
+            v_cache.view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)),
             block_table=self.forward_metadata.block_tables,
             block_size=self.page_size,
             num_heads=layer.tp_q_head_num,
@@ -2035,12 +2047,12 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if not self.use_mla:
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-            )
-            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-            )
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim))
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim))
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
 
             if not self.graph_mode:
@@ -2315,12 +2327,16 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia:
                 k_cache = (
                     self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                    .view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim))
                     .contiguous()
                 )
                 v_cache = (
                     self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                    .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                    .view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim))
                     .contiguous()
                 )
                 query = q.reshape(
@@ -2405,12 +2421,12 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 block_tables = self.forward_metadata.block_tables
                 attn_mask = None
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-            )
-            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-            )
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim))
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim))
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
             if seq_lens_cpu_int is None:
                 actual_seq_len_kv = seq_lens_cpu_list
@@ -2644,12 +2660,12 @@ class AscendAttnBackend(AttentionBackend):
                             layer.tp_q_head_num,
                             layer.qk_head_dim,
                         ),
-                        k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                        ),
-                        v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-                        ),
+                        k_cache.view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)),
+                        v_cache.view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)),
                         num_query_heads=layer.tp_q_head_num,
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="BSND",
@@ -2697,12 +2713,12 @@ class AscendAttnBackend(AttentionBackend):
                         layer.tp_q_head_num,
                         layer.qk_head_dim,
                     ),
-                    k_cache.view(
-                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                    ),
-                    v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-                    ),
+                    k_cache.view((-1, layer.tp_k_head_num, layer.qk_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)),
+                    v_cache.view((-1, layer.tp_v_head_num, layer.v_head_dim // 16, self.page_size, 16)
+                      if is_qkv_norm_rope_opt()
+                      else (-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)),
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="BSND",
