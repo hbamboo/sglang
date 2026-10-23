@@ -56,6 +56,28 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# Ascend: fuse SwiGLU with the downstream per-token MXFP8 dynamic quant
+# (``npu_swiglu_mx_quant``), emitting a ``(quant, block_scale)`` tuple for the
+# following MXFP8 linear.
+_SGLANG_NPU_FUSED_SWIGLU_QUANT = get_bool_env_var(
+    "SGLANG_NPU_FUSED_SWIGLU_QUANT", "0"
+)
+
+
+def _npu_fuse_swiglu_mx_quant(
+    x: torch.Tensor, quant_linear: Optional[nn.Module]
+) -> bool:
+    """Whether SwiGLU + DynamicQuant can run as one fused Ascend kernel."""
+    if not _SGLANG_NPU_FUSED_SWIGLU_QUANT or quant_linear is None:
+        return False
+    return (
+        getattr(quant_linear, "_sgl_npu_mx_quant_fusable", False)
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.numel() > 0
+        and getattr(quant_linear, "tp_size", 1) == 1
+    )
+
 if _is_cuda:
     from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
     from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
@@ -138,43 +160,67 @@ class SiluAndMul(BaseFusedOp):
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_native(
+        self, x: torch.Tensor, quant_linear: Optional[nn.Module] = None
+    ) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cuda(
+        self, x: torch.Tensor, quant_linear: Optional[nn.Module] = None
+    ) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
 
-    def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
+    def forward_aiter(
+        self,
+        x: torch.Tensor,
+        limit: float = 0.0,
+        quant_linear: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         _aiter_silu_and_mul(out, x, limit)
         return out
 
-    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cpu(
+        self, x: torch.Tensor, quant_linear: Optional[nn.Module] = None
+    ) -> torch.Tensor:
         if _is_cpu_amx_available:
             out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
             return out
         else:
             return self.forward_native(x)
 
-    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_npu(
+        self, x: torch.Tensor, quant_linear: Optional[nn.Module] = None
+    ) -> torch.Tensor:
+        if _npu_fuse_swiglu_mx_quant(x, quant_linear):
+            # SwiGLU + per-token MXFP8 quant.  ``activate_left=True`` matches
+            # npu_swiglu's silu(first half) * second half convention, so this is
+            # bit-exact with npu_swiglu + npu_dynamic_mx_quant.
+            return torch_npu.npu_swiglu_mx_quant(
+                x, dst_type=torch.float8_e4m3fn, activate_left=True
+            )
         out = torch_npu.npu_swiglu(x)
         return out
 
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_xpu(
+        self, x: torch.Tensor, quant_linear: Optional[nn.Module] = None
+    ) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
 
-    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_musa(
+        self, x: torch.Tensor, quant_linear: Optional[nn.Module] = None
+    ) -> torch.Tensor:
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             return self.forward_native(x)
 

@@ -100,7 +100,10 @@ class Qwen2MLP(nn.Module):
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        # ``quant_linear`` lets the activation fuse its output quantisation
+        # with the SwiGLU kernel on backends that support it (Ascend MXFP8);
+        # everywhere else the argument is ignored.
+        x = self.act_fn(gate_up, quant_linear=self.down_proj)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 

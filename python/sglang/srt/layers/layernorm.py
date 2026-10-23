@@ -58,6 +58,39 @@ _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
 
+# Ascend: fuse the residual add + RMSNorm with the downstream per-token MXFP8
+# dynamic quant (``npu_add_rms_norm_dynamic_mx_quant``).  The fused kernel emits
+# the quantised activation, so the following MXFP8 linear must consume the
+# ``(quant, block_scale)`` tuple instead of quantising the norm output again.
+_SGLANG_NPU_FUSED_ADD_RMSNORM_QUANT = get_bool_env_var(
+    "SGLANG_NPU_FUSED_ADD_RMSNORM_QUANT", "0"
+)
+
+
+def _npu_fuse_add_rmsnorm_mx_quant(
+    norm: nn.Module, x: torch.Tensor, quant_linear: Optional[nn.Module]
+) -> bool:
+    """Whether AddRmsNorm + DynamicQuant can run as one fused Ascend kernel.
+
+    The consumer contract (a tuple instead of a tensor) is only valid when the
+    linear receives the full activation unsplit, so tensor parallelism is
+    excluded; the fused kernel is also bf16-only and needs the standard
+    non-deterministic norm configuration.
+    """
+    if not _SGLANG_NPU_FUSED_ADD_RMSNORM_QUANT or quant_linear is None:
+        return False
+    return (
+        getattr(quant_linear, "_sgl_npu_mx_quant_fusable", False)
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.numel() > 0
+        and norm.has_weight
+        and norm.weight.dtype == x.dtype
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
+        and getattr(quant_linear, "tp_size", 1) == 1
+    )
+
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
@@ -618,6 +651,19 @@ class RMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            if _npu_fuse_add_rmsnorm_mx_quant(self, x, quant_linear):
+                # add + RMSNorm + per-token MXFP8 quant in one kernel.
+                # Returns (quant, residual_out, block_scale, unused).
+                q_out, residual_out, q_scale, _ = (
+                    torch_npu.npu_add_rms_norm_dynamic_mx_quant(
+                        residual,
+                        x,
+                        self.weight.data,
+                        epsilon=self.variance_epsilon,
+                        dst_type=torch.float8_e4m3fn,
+                    )
+                )
+                return (q_out, q_scale), residual_out
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )
