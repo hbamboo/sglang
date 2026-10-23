@@ -322,8 +322,6 @@ def _cp_allgather_and_save_kv_npu(
     )
 
 
-_FAQ_DEFAULT_KV_LAYOUT = "PA_BBND"
-
 _FA_SEQ_BUCKET = 4096
 
 
@@ -727,7 +725,7 @@ class AscendAttnBackend(AttentionBackend):
         seqused_kv: torch.Tensor,
         cu_seqlens_q=None,
         prefill: bool = False,
-        layout_kv: str = _FAQ_DEFAULT_KV_LAYOUT,
+        layout_kv: str = fa_adapter.KV_LAYOUT_BBND,
     ):
         """Cached FlashAttn metadata: one tensor per static shape.
 

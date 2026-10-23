@@ -11,8 +11,9 @@ errors if you get them wrong, so every call goes through this module.
    When the KV pool is physically stored PA_NZ (``ENABLE_QKV_NORM_ROPE_OPT``,
    written by ``qkv_rms_norm_rope_cache``), the very same buffer must instead be
    viewed 5-D ``(num_blocks, KV_N, D//16, block_size, 16)`` and passed with
-   ``layout_kv="PA_NZ"``; a 4-D view of a PA_NZ buffer is accepted by the op but
-   silently reads the wrong element order.  See ``paged_kv_view``.
+   ``layout_kv="PA_NZ"``; feeding a PA_NZ buffer with the 4-D layout instead
+   reads a permuted element order (wrong results, no error).  See
+   ``paged_kv_view``.
 2. **Causal mask convention.**  ``mask_mode=3`` needs an ``int8``
    ``triu(ones(2048, 2048), 1)`` mask (1 = masked).  FIA's ``bool ~tril`` mask
    silently produces garbage (cos ~ 0.07).  The mask is a fixed template, so
