@@ -617,6 +617,7 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[torch.nn.Module] = None,
     ):
         # residual is None marks the first decoder layer, where the SP region
         # opens: re-evaluated per forward so a crash mid-loop cannot leak into
@@ -682,7 +683,7 @@ class LayerCommunicator:
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
-                        hidden_states, residual
+                        hidden_states, residual, quant_linear=quant_linear
                     )
             else:
                 if residual is None:
@@ -736,7 +737,9 @@ class LayerCommunicator:
                         )
 
                     else:
-                        hidden_states = self.input_layernorm(hidden_states)
+                        hidden_states = self.input_layernorm(
+                            hidden_states, quant_linear=quant_linear
+                        )
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
@@ -792,6 +795,7 @@ class LayerCommunicator:
                             hidden_states,
                             residual,
                             post_residual_addition,
+                            quant_linear=quant_linear,
                         )
 
         hidden_states = self._communicate_simple_fn(
@@ -831,6 +835,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        quant_linear: Optional[torch.nn.Module] = None,
     ):
         if self._sp_variant is not None and get_forward().sp_active:
             return self._sp_variant.prepare_mlp(
@@ -838,6 +843,21 @@ class LayerCommunicator:
             )
         if cache is not None:
             self._context.cache = cache
+
+        if (
+            quant_linear is not None
+            and self._communicate_with_all_reduce_and_layer_norm_fn
+            is CommunicateWithAllReduceAndLayerNormFn._simple
+        ):
+            # Single-rank attention TP: the communicator wrapper would do nothing
+            # but call the norm, so call it directly -- this keeps the fused
+            # AddRmsNorm+DynamicQuant output (a (quant, scale) tuple) intact,
+            # which the generic communication paths are not required to handle.
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual, quant_linear=quant_linear
+                )
+            return hidden_states, residual
 
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,

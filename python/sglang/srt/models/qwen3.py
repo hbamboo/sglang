@@ -316,8 +316,20 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_exec().deterministic.rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None and not isinstance(
+            hidden_states, tuple
+        ):
             hidden_states = hidden_states.bfloat16()
+
+        # The fused AddRmsNorm + DynamicQuant path hands over a (quant, scale)
+        # tuple, so dtype/shape probes must look at the activation itself.
+        hidden_dtype = (
+            # Fused AddRmsNorm+DynamicQuant hands over an already-quantised
+            # (quant, scale) tuple: the activation itself is bf16.
+            torch.bfloat16
+            if isinstance(hidden_states, tuple)
+            else hidden_states.dtype
+        )
 
         save_kv_cache = True
         use_aiter_fused = (
@@ -333,7 +345,7 @@ class Qwen3Attention(nn.Module):
         use_qkv_norm_rope = (
             _use_qkv_norm_rope_opt
             and self.head_dim == 128
-            and hidden_states.dtype == torch.bfloat16
+            and hidden_dtype == torch.bfloat16
             and (
                 forward_batch.forward_mode.is_extend()
                 or _use_qkv_norm_rope_decode
@@ -463,8 +475,16 @@ class Qwen3DecoderLayer(nn.Module):
             residual,
             forward_batch,
             post_residual_addition=post_residual_addition,
+            # Enables the fused AddRmsNorm + DynamicQuant on Ascend: the norm
+            # may return the already-quantised (quant, scale) tuple.
+            quant_linear=self.self_attn.qkv_proj,
         )
-        if hidden_states.shape[0] != 0:
+        num_tokens = (
+            hidden_states[0].shape[0]
+            if isinstance(hidden_states, tuple)
+            else hidden_states.shape[0]
+        )
+        if num_tokens != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -476,6 +496,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
+            quant_linear=self.mlp.gate_up_proj,
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
                 if _is_npu
