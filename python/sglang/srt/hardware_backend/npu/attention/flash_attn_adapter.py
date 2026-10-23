@@ -8,6 +8,11 @@ errors if you get them wrong, so every call goes through this module.
 1. **Paged KV layout.**  k/v must be 4-D ``(num_blocks, block_size, KV_N, D)``
    with ``layout_kv="PA_BBND"``.  Handing it ``"BSND"`` for paged KV makes
    tiling fail and surfaces only as ``Check NnopbaseRunForWorkspace(*) failed``.
+   When the KV pool is physically stored PA_NZ (``ENABLE_QKV_NORM_ROPE_OPT``,
+   written by ``qkv_rms_norm_rope_cache``), the very same buffer must instead be
+   viewed 5-D ``(num_blocks, KV_N, D//16, block_size, 16)`` and passed with
+   ``layout_kv="PA_NZ"``; a 4-D view of a PA_NZ buffer is accepted by the op but
+   silently reads the wrong element order.  See ``paged_kv_view``.
 2. **Causal mask convention.**  ``mask_mode=3`` needs an ``int8``
    ``triu(ones(2048, 2048), 1)`` mask (1 = masked).  FIA's ``bool ~tril`` mask
    silently produces garbage (cos ~ 0.07).  The mask is a fixed template, so
@@ -47,10 +52,16 @@ __all__ = [
     "decode",
     "extend",
     "warmup",
+    "KV_LAYOUT_BBND",
+    "KV_LAYOUT_NZ",
 ]
 
-# Paged KV is always PA_BBND: (num_blocks, block_size, KV_N, D).
-_KV_LAYOUT = "PA_BBND"
+# Paged KV physical layouts:
+#   PA_BBND (default): (num_blocks, block_size, KV_N, D)
+#   PA_NZ            : (num_blocks, KV_N, D//16, block_size, 16)
+KV_LAYOUT_BBND = "PA_BBND"
+KV_LAYOUT_NZ = "PA_NZ"
+_KV_LAYOUT = KV_LAYOUT_BBND
 _LAYOUT_DENSE = "BSND"
 _LAYOUT_RAGGED = "TND"
 
@@ -129,12 +140,22 @@ def causal_mask(device=None) -> torch.Tensor:
 
 
 def paged_kv_view(
-    kv_cache: torch.Tensor, page_size: int, num_kv_heads: int, head_dim: int
+    kv_cache: torch.Tensor,
+    page_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    layout_kv: str = KV_LAYOUT_BBND,
 ) -> torch.Tensor:
-    """``(blocks, page, KV_N * D)`` -> ``(blocks, page, KV_N, D)`` PA_BBND view.
+    """Normalise a paged KV pool buffer to the operator's layout.
 
-    The operator rejects non-contiguous k/v, so a plain ``view`` is used and a
-    layout mismatch raises instead of silently copying the whole cache.
+    ``PA_BBND`` -> ``(blocks, page, KV_N, D)``;
+    ``PA_NZ``   -> ``(blocks, KV_N, D // 16, page, 16)``.
+
+    The operator rejects non-contiguous k/v, so a plain ``reshape`` is used and
+    a layout mismatch raises instead of silently copying the whole cache.  Both
+    layouts describe the same flat page buffer, so any full-page-aligned view of
+    it (1-D flat, ``(blocks, page, KV_N * D)``, or an already-correct view) is
+    accepted as input.
     """
     if not kv_cache.is_contiguous():
         raise ValueError(
@@ -152,6 +173,10 @@ def paged_kv_view(
     # call sites (e.g. plain [tokens, H] in extend, [blocks, page, H] in the
     # graph path), so normalise by flattening to pages first -- the same thing
     # FIA's ``view(-1, page_size, kv_heads * head_dim)`` does.
+    if layout_kv == KV_LAYOUT_NZ:
+        return kv_cache.reshape(-1, num_kv_heads, head_dim // 16, page_size, 16)
+    if layout_kv != KV_LAYOUT_BBND:
+        raise NotImplementedError(f"FlashAttn adapter: layout_kv={layout_kv!r}")
     if (
         kv_cache.dim() == 4
         and kv_cache.shape[1] == page_size
@@ -174,6 +199,7 @@ def metadata(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     mask_mode: int = _MASK_MODE_FULL,
     layout_q: str = _LAYOUT_DENSE,
+    layout_kv: str = _KV_LAYOUT,
 ) -> torch.Tensor:
     """Generate the scheduling metadata for one step.
 
@@ -198,7 +224,7 @@ def metadata(
         win_left=-1,
         win_right=-1,
         layout_q=layout_q,
-        layout_kv=_KV_LAYOUT,
+        layout_kv=layout_kv,
         layout_out=layout_q,
     )
 
@@ -221,6 +247,7 @@ def _run(
     block_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     md: Optional[torch.Tensor] = None,
+    layout_kv: str = _KV_LAYOUT,
 ) -> torch.Tensor:
     fa, _ = _ops()
     if mask_mode not in (_MASK_MODE_FULL, _MASK_MODE_CAUSAL):
@@ -230,7 +257,18 @@ def _run(
             f"q shape {tuple(q.shape)} disagrees with num_q_heads={num_q_heads}, "
             f"head_dim={head_dim}"
         )
-    if k.shape[-2] != num_kv_heads or k.shape[-1] != head_dim:
+    if layout_kv == KV_LAYOUT_NZ:
+        # (blocks, KV_N, D // 16, page, 16)
+        if (
+            k.shape[1] != num_kv_heads
+            or k.shape[2] != head_dim // 16
+            or k.shape[4] != 16
+        ):
+            raise ValueError(
+                f"k shape {tuple(k.shape)} disagrees with num_kv_heads={num_kv_heads}, "
+                f"head_dim={head_dim} for layout_kv={layout_kv}"
+            )
+    elif k.shape[-2] != num_kv_heads or k.shape[-1] != head_dim:
         raise ValueError(
             f"k shape {tuple(k.shape)} disagrees with num_kv_heads={num_kv_heads}, "
             f"head_dim={head_dim}"
@@ -256,6 +294,7 @@ def _run(
             cu_seqlens_q=cu_seqlens_q,
             mask_mode=mask_mode,
             layout_q=layout_q,
+            layout_kv=layout_kv,
         )
 
     out, _lse = fa(
@@ -274,7 +313,7 @@ def _run(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_kv=max_seqlen_kv,
         layout_q=layout_q,
-        layout_kv=_KV_LAYOUT,
+        layout_kv=layout_kv,
         layout_out=layout_q,
     )
     return out
@@ -294,14 +333,15 @@ def decode(
     scale: float,
     max_seqlen_kv: int,
     md: Optional[torch.Tensor] = None,
+    layout_kv: str = _KV_LAYOUT,
 ) -> torch.Tensor:
     """Paged-KV decode.
 
     q: ``(bs, 1, num_q_heads, head_dim)`` (BSND); k/v pools are reshaped to
-    PA_BBND internally.  Returns ``(bs, 1, num_q_heads, head_dim)``.
+    ``layout_kv`` internally.  Returns ``(bs, 1, num_q_heads, head_dim)``.
     """
-    k = paged_kv_view(k_cache, page_size, num_kv_heads, head_dim)
-    v = paged_kv_view(v_cache, page_size, num_kv_heads, head_dim)
+    k = paged_kv_view(k_cache, page_size, num_kv_heads, head_dim, layout_kv)
+    v = paged_kv_view(v_cache, page_size, num_kv_heads, head_dim, layout_kv)
     return _run(
         q,
         k,
@@ -318,6 +358,7 @@ def decode(
         layout_q=_LAYOUT_DENSE,
         block_table=block_table,
         md=md,
+        layout_kv=layout_kv,
     )
 
 
@@ -337,13 +378,14 @@ def extend(
     max_seqlen_q: int,
     max_seqlen_kv: int,
     md: Optional[torch.Tensor] = None,
+    layout_kv: str = _KV_LAYOUT,
 ) -> torch.Tensor:
     """Paged-KV causal prefill / extend.
 
     q: ``(num_tokens, num_q_heads, head_dim)`` (TND, ragged via ``cu_seqlens_q``).
     """
-    k = paged_kv_view(k_cache, page_size, num_kv_heads, head_dim)
-    v = paged_kv_view(v_cache, page_size, num_kv_heads, head_dim)
+    k = paged_kv_view(k_cache, page_size, num_kv_heads, head_dim, layout_kv)
+    v = paged_kv_view(v_cache, page_size, num_kv_heads, head_dim, layout_kv)
     return _run(
         q,
         k,
@@ -361,6 +403,7 @@ def extend(
         block_table=block_table,
         cu_seqlens_q=cu_seqlens_q,
         md=md,
+        layout_kv=layout_kv,
     )
 
 

@@ -322,6 +322,8 @@ def _cp_allgather_and_save_kv_npu(
     )
 
 
+_FAQ_DEFAULT_KV_LAYOUT = "PA_BBND"
+
 _FA_SEQ_BUCKET = 4096
 
 
@@ -394,6 +396,22 @@ class AscendAttnBackend(AttentionBackend):
                 logger.info(
                     "Ascend attention: using FlashAttn (ENABLE_ASCEND_FLASH_ATTN=1)."
                 )
+        # ENABLE_QKV_NORM_ROPE_OPT: the KV pool is physically stored in PA_NZ
+        # order (qkv_rms_norm_rope_cache / npu_scatter_pa_kv_cache write it that
+        # way), so the FlashAttn path has to read the same buffer with the
+        # matching layout.  The two switches are independent: FIA keeps its own
+        # (already layout-aware) views above.
+        self.fa_kv_layout = (
+            fa_adapter.KV_LAYOUT_NZ
+            if is_qkv_norm_rope_opt()
+            else fa_adapter.KV_LAYOUT_BBND
+        )
+        if self.use_flash_attn:
+            logger.info(
+                "Ascend attention: FlashAttn KV layout = %s (ENABLE_QKV_NORM_ROPE_OPT=%s).",
+                self.fa_kv_layout,
+                is_qkv_norm_rope_opt(),
+            )
         # FlashAttn metadata cache, keyed by static shape (see
         # _fa_metadata_for). Populated on the warmup calls that precede
         # NPUGraph capture, so the tensors never live in the graph pool.
@@ -709,6 +727,7 @@ class AscendAttnBackend(AttentionBackend):
         seqused_kv: torch.Tensor,
         cu_seqlens_q=None,
         prefill: bool = False,
+        layout_kv: str = _FAQ_DEFAULT_KV_LAYOUT,
     ):
         """Cached FlashAttn metadata: one tensor per static shape.
 
@@ -724,6 +743,7 @@ class AscendAttnBackend(AttentionBackend):
         """
         key = (
             layout,
+            layout_kv,
             mask_mode,
             bs,
             max_seqlen_q,
@@ -748,6 +768,7 @@ class AscendAttnBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 mask_mode=mask_mode,
                 layout_q=layout,
+                layout_kv=layout_kv,
             )
             self._fa_step_meta[key] = md
         return md
@@ -1632,6 +1653,7 @@ class AscendAttnBackend(AttentionBackend):
                 fa_md = self._fa_metadata_for(
                     bs=fa_cu_seqlens_q.numel() - 1,
                     layout="TND",
+                    layout_kv=self.fa_kv_layout,
                     mask_mode=3,
                     max_seqlen_q=fa_max_q,
                     max_seqlen_kv=fa_max_kv,
@@ -1650,6 +1672,7 @@ class AscendAttnBackend(AttentionBackend):
                     fa_cu_seqlens_q,
                     fa_seqused_kv,
                     page_size=self.page_size,
+                    layout_kv=self.fa_kv_layout,
                     num_q_heads=layer.tp_q_head_num,
                     num_kv_heads=layer.tp_k_head_num,
                     head_dim=layer.qk_head_dim,
@@ -2690,6 +2713,7 @@ class AscendAttnBackend(AttentionBackend):
                     seqused_kv=fa_seqused_kv,
                     mask_mode=0,
                     layout_q="BSND",
+                    layout_kv=self.fa_kv_layout,
                 )
                 attn_output = fa_adapter.decode(
                     query.view(
@@ -2700,6 +2724,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables,
                     fa_seqused_kv,
                     page_size=self.page_size,
+                    layout_kv=self.fa_kv_layout,
                     num_q_heads=layer.tp_q_head_num,
                     num_kv_heads=layer.tp_k_head_num,
                     head_dim=layer.qk_head_dim,
@@ -2990,6 +3015,7 @@ class AscendAttnBackend(AttentionBackend):
                 fa_md = self._fa_metadata_for(
                     bs=actual_bs,
                     layout="BSND",
+                    layout_kv=self.fa_kv_layout,
                     mask_mode=0,
                     max_seqlen_q=1,
                     max_seqlen_kv=max_seqlen_kv,
@@ -3007,6 +3033,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.block_tables,
                     seqused_kv,
                     page_size=self.page_size,
+                    layout_kv=self.fa_kv_layout,
                     num_q_heads=layer.tp_q_head_num,
                     num_kv_heads=layer.tp_k_head_num,
                     head_dim=layer.qk_head_dim,
