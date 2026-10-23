@@ -245,6 +245,11 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # physically reorders to [in, out] row-major, making the inner-loop stride
         # equal to out and tanking HBM bandwidth.
 
+        # Producer/consumer contract for the AddRmsNorm / SwiGLU + DynamicQuant
+        # fusion: this method can consume a pre-quantised (quant, scale) tuple,
+        # so those kernels may skip their own npu_dynamic_mx_quant call.
+        layer._sgl_npu_mx_quant_fusable = True
+
         # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
         if (
             getattr(layer, "bias", None) is not None
@@ -262,19 +267,27 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
+        if isinstance(x, tuple):
+            # Already quantised by the fused AddRmsNorm / SwiGLU kernel
+            # (SGLANG_NPU_FUSED_*_QUANT): (quant, e8m0 block scale).
+            qx, input_scale = x
             original_dtype = torch.bfloat16
+            input_shape = qx.shape
+            x_2d = qx.reshape(-1, qx.shape[-1])
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
 
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
+            # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
+            input_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
+            # Dynamic MXFP8 activation quantisation
+            qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
 
         # MXFP8 matmul (weight & scale already transposed at load time)
         # Use the cached FP32 bias from process_weights_after_loading; fall back
