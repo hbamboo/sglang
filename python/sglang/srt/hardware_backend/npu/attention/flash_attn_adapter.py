@@ -26,7 +26,10 @@ errors if you get them wrong, so every call goes through this module.
    layer-dependent state (bit-exact across distinct KV caches) and its shape
    only depends on batch size / head counts, so one tensor per step is shared
    by every layer.  Computing it per layer costs ~38us and makes a 36-layer
-   decode roughly 3x slower.
+   decode roughly 3x slower.  In a captured decode graph that means one
+   metadata *node*: the first attention layer records it, the remaining layers
+   read its output, and each replay recomputes it from the refreshed
+   ``seqused_kv`` (see ``AscendAttnBackend._fa_metadata_for``).
 
 The operator supports Ascend 950PR / 950DT only.  It has no MLA (rope-split
 q/k) and no quantized-KV variant, so those paths must stay on FIA.

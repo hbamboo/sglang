@@ -410,21 +410,21 @@ class AscendAttnBackend(AttentionBackend):
                 self.fa_kv_layout,
                 is_qkv_norm_rope_opt(),
             )
-        # FlashAttn metadata cache, keyed by static shape (see
-        # _fa_metadata_for). Populated on the warmup calls that precede
-        # NPUGraph capture, so the tensors never live in the graph pool.
-        self._fa_meta_cache = {}
-        # Metadata is only valid for the tensors it was built from, so eager
-        # paths rebuild it once per scheduler step (all layers of a step pass
-        # identical arguments, so sharing within the step is consistent).
-        self._fa_step_id = 0
-        self._fa_step_meta = {}
-        # Prefill metadata is keyed by per-step batch shape (not captured in a
-        # graph), so keep it bounded: unbounded growth churns device memory on
-        # every step and fragments the pool.
-        self._fa_prefill_cache = {}
-        self._fa_prefill_cache_order = []
-        self._fa_prefill_cache_max = 64
+        # FlashAttn metadata caches (see _fa_metadata_for).  metadata carries
+        # no layer-dependent state and its shape depends only on batch size /
+        # head counts, so ONE tensor per batch shape serves every layer:
+        #   * _fa_meta_step  - eager steps.  Cleared once per scheduler step
+        #     (init_forward_metadata) because the tensor must describe that
+        #     step's seqused_kv;
+        #   * _fa_meta_graph - graphed passes.  Cleared once per recorded
+        #     forward (init_forward_metadata_in_graph): the first attention
+        #     layer records the metadata node, the rest reuse its output, and
+        #     every replay recomputes it from the in-place refreshed
+        #     seqused_kv.  _fa_meta_keep pins the captured tensors so the graph
+        #     pool never recycles an address a recorded node still writes.
+        self._fa_meta_step = {}
+        self._fa_meta_graph = {}
+        self._fa_meta_keep = []
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -545,6 +545,20 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
         )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Start of one graph-recorded forward pass.
+
+        Runs at the top of ``run_once`` -- once per warmup pass and once for
+        the capturing pass itself -- so it is the exact lifetime of one
+        FlashAttn metadata tensor.  The tensor the first attention layer builds
+        here becomes a node of the captured graph; replaying it recomputes the
+        metadata from this step's (in-place refreshed) seqused_kv, and the
+        remaining layers read that single tensor instead of rebuilding it per
+        layer.
+        """
+        if self.use_flash_attn:
+            self._fa_meta_graph.clear()
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -596,9 +610,8 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
-        # New step: drop the previous step's FlashAttn metadata.
-        self._fa_step_id += 1
-        self._fa_step_meta.clear()
+        # New step: eager FlashAttn metadata describes this step's tensors only.
+        self._fa_meta_step.clear()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -727,35 +740,37 @@ class AscendAttnBackend(AttentionBackend):
         prefill: bool = False,
         layout_kv: str = fa_adapter.KV_LAYOUT_BBND,
     ):
-        """Cached FlashAttn metadata: one tensor per static shape.
+        """FlashAttn metadata for this step / graphed pass and head config.
 
-        The tensor content does track ``seqused_kv``, but feeding a stale
-        one produces bit-identical results (verified elementwise), so it
-        is reused across steps and only rebuilt when a shape changes
-        (batch size / layout / max seq len / head counts).
+        The operator trusts the metadata it is handed, so it must describe the
+        very tensors of this call (see flash_attn_adapter point 3).  What it
+        does *not* carry is any layer-dependent state: content only tracks
+        ``seqused_kv`` and the shape depends only on batch size / head counts,
+        so one tensor is shared by every layer of a step (point 4).  Building
+        it per layer costs ~36us of AI_CPU time per layer, which is why the
+        cache exists at all.
 
-        It must be allocated OUTSIDE an NPUGraph capture pool: a tensor
-        created during capture can have its memory recycled by the pool,
-        which corrupts the schedule.  The graph runner runs warmup calls
-        before capturing, so the first call lands outside.
+        Lifetime: one step (eager) or one recorded forward (graph).  Inside a
+        capture the tensor is produced by the graph itself -- the first layer
+        records the metadata node, the rest reuse its output, and each replay
+        recomputes it from the freshly updated seqused_kv.  A tensor built by
+        the pre-capture warmup run must never be reused by the capture (its
+        address is not owned by the graph), hence the ``captured`` flag.
         """
         key = (
+            bs,
             layout,
             layout_kv,
             mask_mode,
-            bs,
             max_seqlen_q,
             max_seqlen_kv,
             num_q_heads,
             num_kv_heads,
             head_dim,
         )
-        # Documented contract: metadata must describe the very tensors passed to
-        # flash_attn.  Keyed by the step id => always fresh per step, never
-        # reused across steps.
-        md = self._fa_step_meta.get(key)
-        if md is None:
-            md = fa_adapter.metadata(
+
+        def _build():
+            return fa_adapter.metadata(
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
@@ -768,7 +783,34 @@ class AscendAttnBackend(AttentionBackend):
                 layout_q=layout,
                 layout_kv=layout_kv,
             )
-            self._fa_step_meta[key] = md
+
+        if not self.graph_mode:
+            md = self._fa_meta_step.get(key)
+            if md is None:
+                md = _build()
+                self._fa_meta_step[key] = md
+            self.forward_metadata.fa_metadata = md
+            return md
+
+        entry = self._fa_meta_graph.get(key)
+        if entry is not None and entry[1]:
+            # Recorded inside this capture: every layer reads this tensor.
+            md = entry[0]
+            self.forward_metadata.fa_metadata = md
+            return md
+
+        capturing = torch.npu.is_current_stream_capturing()
+        if entry is not None and not capturing:
+            # Warmup pass (or an eager fallback) inside a graphed flow.
+            md = entry[0]
+            self.forward_metadata.fa_metadata = md
+            return md
+
+        md = _build()
+        self._fa_meta_graph[key] = (md, capturing)
+        if capturing:
+            self._fa_meta_keep.append(md)
+        self.forward_metadata.fa_metadata = md
         return md
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -2698,20 +2740,22 @@ class AscendAttnBackend(AttentionBackend):
                     fa_seqused_kv = self.forward_metadata.seq_lens[
                         :fa_bs
                     ].clamp(min=1)
-                # Built inside the captured graph: every replay recomputes it
-                # from the same (in-place updated) tensors, so metadata and the
-                # operator arguments stay consistent by construction.
-                fa_md = fa_adapter.metadata(
-                    layer.tp_q_head_num,
-                    layer.tp_k_head_num,
-                    layer.qk_head_dim,
-                    batch_size=fa_bs,
+                # ONE metadata tensor per graphed step: the first layer records
+                # the metadata node inside the capture, the rest reuse it, and
+                # every replay recomputes it from the in-place updated
+                # seqused_kv (see _fa_metadata_for).  Same layout_kv as the
+                # decode() call below -- the kernel trusts the schedule.
+                fa_md = self._fa_metadata_for(
+                    bs=fa_bs,
+                    layout="BSND",
+                    layout_kv=self.fa_kv_layout,
+                    mask_mode=0,
                     max_seqlen_q=1,
                     max_seqlen_kv=fa_max_kv,
+                    num_q_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    head_dim=layer.qk_head_dim,
                     seqused_kv=fa_seqused_kv,
-                    mask_mode=0,
-                    layout_q="BSND",
-                    layout_kv=self.fa_kv_layout,
                 )
                 attn_output = fa_adapter.decode(
                     query.view(
