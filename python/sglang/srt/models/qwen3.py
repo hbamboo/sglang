@@ -44,9 +44,9 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_qkv_norm_rope_opt = _is_npu and get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
-_use_qkv_norm_rope_decode = _use_qkv_norm_rope_opt and get_bool_env_var(
-    "ENABLE_QKV_NORM_ROPE_OPT_DECODE"
-)
+#_use_qkv_norm_rope_decode = _use_qkv_norm_rope_opt and get_bool_env_var(
+#    "ENABLE_QKV_NORM_ROPE_OPT_DECODE"
+#)
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:
@@ -334,10 +334,10 @@ class Qwen3Attention(nn.Module):
             _use_qkv_norm_rope_opt
             and self.head_dim == 128
             and hidden_states.dtype == torch.bfloat16
-            and (
-                forward_batch.forward_mode.is_extend()
-                or _use_qkv_norm_rope_decode
-            )
+            #and (
+            #    forward_batch.forward_mode.is_extend()
+            #    or _use_qkv_norm_rope_decode
+            #)
         )
 
         if use_aiter_fused:
