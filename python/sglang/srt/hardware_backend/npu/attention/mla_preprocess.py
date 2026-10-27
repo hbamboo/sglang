@@ -25,7 +25,10 @@ def is_mla_preprocess_enabled() -> bool:
         envs.ENABLE_ASCEND_FLASH_MLA.get()
         or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
     ):
-        return False
+        # The ported MlaPrologV3 path stages its KV in a scratch and lands it
+        # through the pool, so it does run on top of the fused layout; the
+        # legacy int8 prologue still addresses the split buffers and stays off.
+        return is_mlaprolog_v3_enabled()
     # The ported MlaPrologV3 path lives inside the MLAPO prologue, so enabling
     # it implies the fused prologue (and the save_kv_cache=False handshake).
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO") or is_mlaprolog_v3_enabled()
@@ -577,10 +580,20 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 )
 
         cos, sin = self.get_sin_cos(positions)
-        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
-        page_size = get_attn_backend().page_size
-        kv_cache = k_cache.view(-1, page_size, 1, self.kv_lora_rank)
-        kr_cache = v_cache.view(-1, page_size, 1, self.qk_rope_head_dim)
+        pool = get_token_to_kv_pool()
+        unified_kv = bool(getattr(pool, "flash_mla", False))
+        if unified_kv:
+            kv_cache, kr_cache, cache_index = self._v3_scratch_cache(
+                hidden_states, pool
+            )
+        else:
+            k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(
+                forward_batch
+            )
+            page_size = get_attn_backend().page_size
+            kv_cache = k_cache.view(-1, page_size, 1, self.kv_lora_rank)
+            kr_cache = v_cache.view(-1, page_size, 1, self.qk_rope_head_dim)
+            cache_index = slot_mapping.to(dtype=torch.int64)
 
         q_nope, q_pe, _, q_norm, _ = torch.ops.npu.mla_prolog_v3(
             token_x=hidden_states,
@@ -594,13 +607,29 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             rope_cos=cos,
             kv_cache=kv_cache,
             kr_cache=kr_cache,
-            cache_index=slot_mapping.to(dtype=torch.int64),
+            cache_index=cache_index,
             rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
             cache_mode="PA_BSND",
             query_norm_flag=True,
             weight_quant_mode=0,  # weights are bf16 (dequantised above)
         )
+
+        if unified_kv:
+            # The kernel can only address a packed (blocks, page, 1, W) cache, so
+            # it wrote the one-step scratch above; land those rows in the fused
+            # pool the same way set_kv_buffer() does.  The attention backend
+            # reads the pool directly, MLAPO reports save_kv_cache=False.
+            num_tokens = hidden_states.shape[0]
+            pool.set_unified_mla_kv(
+                self.layer_id,
+                forward_batch.out_cache_loc,
+                kv_cache.reshape(-1, self.kv_lora_rank)[:num_tokens],
+                kr_cache.reshape(-1, self.qk_rope_head_dim)[:num_tokens],
+            )
+            kv_cache = pool.k_buffer[self.layer_id - pool.start_layer]
+            kr_cache = pool.v_buffer[self.layer_id - pool.start_layer]
+
         # q_norm is the normalised q_lora: only the DSA indexer consumes it, and
         # the attention backend already reports save_kv_cache=False for MLAPO.
         return (
@@ -613,6 +642,45 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             positions,
             None,
         )
+
+    def _v3_scratch_cache(self, hidden_states, pool):
+        """One step of packed cache for MlaPrologV3 on the fused 576-wide pool.
+
+        The kernel assumes ``kv_cache``/``kr_cache`` hold latent and rope in two
+        separate packed buffers (``cacheMode="PA_BSND"`` addresses row
+        ``cache_index[t]`` of a flat ``(rows, headSize)`` view), while the fused
+        pool interleaves both per token, so the prologue writes a throw-away
+        one-step cache here and the rows are landed in the pool afterwards.
+
+        The page dimension below is only there to satisfy the kernel's
+        ``blockSize`` check (16..1024, 16-aligned); it does not have to match the
+        pool's page size because the addressing is flat.
+        """
+        if pool.store_dtype != pool.dtype:
+            raise NotImplementedError(
+                "MlaPrologV3 on the unified MLA KV layout requires an unquantised "
+                "KV pool (store_dtype %s != dtype %s)"
+                % (pool.store_dtype, pool.dtype)
+            )
+        page_size = getattr(pool, "page_size", 0) or 0
+        if page_size < 16 or page_size > 1024 or page_size % 16:
+            page_size = 128
+        num_tokens = hidden_states.shape[0]
+        num_blocks = (num_tokens + page_size - 1) // page_size
+        device = hidden_states.device
+        dtype = pool.store_dtype
+        kv_cache = torch.empty(
+            (num_blocks, page_size, 1, self.kv_lora_rank),
+            dtype=dtype,
+            device=device,
+        )
+        kr_cache = torch.empty(
+            (num_blocks, page_size, 1, self.qk_rope_head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        cache_index = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        return kv_cache, kr_cache, cache_index
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
