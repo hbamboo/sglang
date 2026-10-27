@@ -58,9 +58,14 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
-def is_prefill_tnd_disabled() -> bool:
-    """SGLANG_NPU_DISABLE_PREFILL_TND=1 keeps the per-request FIA loop."""
-    return get_bool_env_var("SGLANG_NPU_DISABLE_PREFILL_TND")
+def is_prefill_tnd_enabled() -> bool:
+    """SGLANG_NPU_ENABLE_PREFILL_TND=1: one FIA TND call per layer per batch.
+
+    Opt-in: it collapses the per-request FIA loop into a single kernel, but the
+    measured end-to-end prefill gain is ~0..5% (each per-request call already
+    runs near the cube limit), so it is not the default.
+    """
+    return get_bool_env_var("SGLANG_NPU_ENABLE_PREFILL_TND")
 
 
 @lru_cache(maxsize=1)
@@ -2326,7 +2331,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 if (
                     layer.tp_q_head_num == layer.tp_k_head_num
-                    and not is_prefill_tnd_disabled()
+                    and is_prefill_tnd_enabled()
                 ):
                     # Pack per-request (prefix || chunk) K/V and run the whole
                     # prefill batch as one TND kernel.  sparse_mode=3
@@ -2534,7 +2539,7 @@ class AscendAttnBackend(AttentionBackend):
                 if (
                     layer.tp_q_head_num == layer.tp_k_head_num
                     and self.forward_metadata.seq_lens_list_cumsum is not None
-                    and not is_prefill_tnd_disabled()
+                    and is_prefill_tnd_enabled()
                 ):
                     # One TND kernel for the whole prefill batch (no prefix).
                     # TND needs q_heads == kv_heads, which holds for this
