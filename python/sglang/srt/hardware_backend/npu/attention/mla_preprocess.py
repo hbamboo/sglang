@@ -19,9 +19,11 @@ if TYPE_CHECKING:
 
 @lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
-    # Legacy MLAPO writes split KV; retain the layout guard until the
-    # scratch/scatter compatibility change is applied.
-    if envs.ENABLE_ASCEND_FLASH_MLA.get():
+    # Legacy MLAPO writes two separate buffers; V3 compatibility is applied next.
+    if (
+        envs.ENABLE_ASCEND_FLASH_MLA.get()
+        or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
+    ):
         return False
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO") or is_mlaprolog_v3_enabled()
 

@@ -758,6 +758,10 @@ class Envs:
     # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
     # Set only on P. Zero preserves the existing capacity calculation.
     SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB = EnvInt(0)
+    # Split-buffer fused sinks cannot write the interleaved latent pool.
+    SGLANG_NPU_DISABLE_YARN_KV_SINK = EnvBool(False)
+    # Select only the unified latent KV layout; attention may remain FIA on P.
+    SGLANG_NPU_MLA_UNIFIED_KV = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)

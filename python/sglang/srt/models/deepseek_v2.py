@@ -1910,7 +1910,13 @@ class DeepseekV2AttentionMLA(
                 self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
         else:
             self.rotary_emb = None
-        self.use_deepseek_yarn_rope = rope_scaling is not None
+        # The fused yarn sink writes packed split buffers, so use the ordinary
+        # latent writer for the interleaved KV layout shared with FlashMLA.
+        self.use_deepseek_yarn_rope = rope_scaling is not None and not (
+            envs.ENABLE_ASCEND_FLASH_MLA.get()
+            or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
+            or envs.SGLANG_NPU_DISABLE_YARN_KV_SINK.get()
+        )
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
