@@ -748,6 +748,10 @@ class Envs:
     # Use the Ascend FlashAttn op (cann_ops_transformer.flash_attn) instead of
     # FusedInferAttentionScore on Ascend 950PR/950DT. See flash_attn_adapter.py.
     ENABLE_ASCEND_FLASH_ATTN = EnvBool(False)
+    # Use the Ascend dense-MLA op (cann_ops_transformer.flash_mla) for
+    # decode on Ascend 950PR/950DT.  Also switches the NPU MLA KV pool to one
+    # contiguous 576-wide latent buffer (see flash_mla_adapter.py).
+    ENABLE_ASCEND_FLASH_MLA = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)

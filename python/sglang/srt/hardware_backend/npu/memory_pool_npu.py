@@ -25,6 +25,18 @@ if is_npu():
 _USE_QKV_NORM_ROPE_OPT = get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
 
 
+def is_flash_mla_enabled() -> bool:
+    """ENABLE_ASCEND_FLASH_MLA: dense-MLA decode uses cann_ops_transformer.flash_mla.
+
+    That op reads the paged latent KV as ONE contiguous 576-wide tensor
+    (512 nope + 64 rope per token), while the default NPU MLA pool keeps the
+    two halves in two buffers.  Fusing them per step would copy the whole
+    cache, so the layout has to be chosen at allocation time -- see
+    flash_mla_adapter.py.
+    """
+    return envs.ENABLE_ASCEND_FLASH_MLA.get()
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,
@@ -575,30 +587,52 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self.custom_mem_pool = None
 
+        self.flash_mla = is_flash_mla_enabled()
+        kv_width = self.kv_lora_rank + self.qk_rope_head_dim
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
+            if self.flash_mla:
+                # flash_mla wants one PA_BBND (blocks, page, 1, 576) latent
+                # buffer.  k_buffer / v_buffer stay as (non-contiguous) views
+                # of its two halves so the prefill-side writers/readers that
+                # predate this switch keep their 512 / 64 shapes.
+                self.kv_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        kv_width,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.k_buffer = self.kv_buffer[..., : self.kv_lora_rank]
+                self.v_buffer = self.kv_buffer[..., self.kv_lora_rank :]
+            else:
+                self.kv_buffer = None
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.kv_lora_rank,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.v_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.qk_rope_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
@@ -669,9 +703,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.index_k_buffer[layer_id - self.start_layer]
 
+    def get_flash_mla_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        """PA_BBND ``(blocks, page, 1, 576)`` latent buffer read by flash_mla."""
+        if not self.flash_mla:
+            raise RuntimeError(
+                "get_flash_mla_kv_buffer requires ENABLE_ASCEND_FLASH_MLA"
+            )
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        if self.store_dtype != self.dtype:
+            buf = buf.view(self.dtype)
+        return buf
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        if self.flash_mla:
+            # One allocation per layer; k_buffer/v_buffer are views of it, so
+            # reporting both would double-count the KV pool.
+            kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+            kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+            kv_item_lens = [
+                self.kv_buffer[i][0].nbytes for i in range(self.layer_num)
+            ]
+            return kv_data_ptrs, kv_data_lens, kv_item_lens
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
             self.v_buffer[i].data_ptr() for i in range(self.layer_num)
         ]
@@ -714,6 +770,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k, cache_v = cache_k.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+
+        if self.flash_mla:
+            # Single scatter of (latent || rope) so the page stays interleaved
+            # exactly as flash_mla reads it.
+            width = self.kv_lora_rank + self.qk_rope_head_dim
+            merged = torch.cat(
+                [
+                    cache_k.reshape(-1, self.kv_lora_rank),
+                    cache_v.reshape(-1, self.qk_rope_head_dim),
+                ],
+                dim=-1,
+            )
+            torch_npu.npu_scatter_nd_update_(
+                self.kv_buffer[layer_id - self.start_layer].view(-1, 1, width),
+                loc.view(-1, 1),
+                merged.view(-1, 1, width),
+            )
+            return
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),

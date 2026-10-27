@@ -22,6 +22,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.attention import (
     flash_attn_adapter as fa_adapter,
 )
+from sglang.srt.hardware_backend.npu.attention import (
+    flash_mla_adapter as fmla_adapter,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -59,6 +62,17 @@ def is_qkv_norm_rope_opt() -> bool:
     return get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
 
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _fmla_kv_bucket(kv_len: int, bucket: int = 512) -> int:
+    """Round a decode KV length up to the flash_mla metadata bucket.
+
+    metadata only depends on shapes, so keying the cache by a bucket (instead
+    of regenerating per step) keeps one tensor alive across steps while still
+    describing a max_seqlen_kv that is >= the real one.
+    """
+    kv_len = max(int(kv_len), 1)
+    return max(bucket, ((kv_len + bucket - 1) // bucket) * bucket)
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -117,6 +131,16 @@ class ForwardMetadata:
     fa_seqused_kv: Optional[torch.Tensor] = None
     fa_cu_seqlens_q: Optional[torch.Tensor] = None
     fa_metadata: Optional[torch.Tensor] = None
+
+    # FlashMLA (ENABLE_ASCEND_FLASH_MLA) step-level buffers.  Its metadata is
+    # shape-only, so one tensor serves every layer of a step and every step
+    # that hits the same (batch, max_seqlen_kv) bucket.  In a captured graph
+    # the first attention layer records the single node and each replay
+    # recomputes it from the in-place refreshed fmla_seqused_kv, exactly like
+    # the FlashAttn path (see flash_mla_adapter point 3).
+    fmla_seqused_kv: Optional[torch.Tensor] = None
+    fmla_metadata: Optional[torch.Tensor] = None
+    fmla_max_seqlen_kv: Optional[int] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -425,6 +449,14 @@ class AscendAttnBackend(AttentionBackend):
         self._fa_meta_step = {}
         self._fa_meta_graph = {}
         self._fa_meta_keep = []
+        # FlashMLA metadata caches (see _fmla_metadata_for):
+        #   * _fmla_meta_cache - eager steps, keyed by batch bucket / head
+        #     config.  NOT cleared per step: the tensor is shape-only.
+        #   * _fmla_meta_graph - one entry per captured graph, re-executed per
+        #     replay from the graph-owned seqused_kv buffer.
+        self._fmla_meta_cache = {}
+        self._fmla_meta_graph = {}
+        self._fmla_meta_keep = []
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -436,6 +468,42 @@ class AscendAttnBackend(AttentionBackend):
                     int(self.speculative_num_draft_tokens), is_draft_worker=True
                 )
             )
+        # Dense MLA on Ascend 950PR/950DT: cann_ops_transformer.flash_mla
+        # reads the absorbed 576-wide (512 nope + 64 rope) latent KV.  The KV
+        # pool is switched to the matching single-buffer layout by
+        # ENABLE_ASCEND_FLASH_MLA in NPUMLATokenToKVPool, so the two must be
+        # enabled together.
+        self.use_flash_mla = False
+        if envs.ENABLE_ASCEND_FLASH_MLA.get():
+            reason = fmla_adapter.unsupported_reason(
+                device_name=torch_npu.npu.get_device_name(
+                    torch_npu.npu.current_device()
+                ),
+                is_mla=self.use_mla,
+                page_size=self.page_size,
+                head_dim_qk=(
+                    self.kv_lora_rank + self.qk_rope_head_dim
+                    if self.use_mla
+                    else None
+                ),
+                head_dim_v=self.kv_lora_rank if self.use_mla else None,
+                num_kv_heads=1 if self.use_mla else None,
+            )
+            if reason is None and self.speculative_num_draft_tokens is not None:
+                reason = "speculative decode (MTP) is not wired to flash_mla yet"
+            if reason is None and is_mla_preprocess_enabled():
+                reason = "SGLANG_NPU_USE_MLAPO writes the latent KV in two buffers"
+            if reason is not None:
+                logger.warning(
+                    "ENABLE_ASCEND_FLASH_MLA=1 ignored (%s); keeping FIA.", reason
+                )
+            else:
+                self.use_flash_mla = True
+                fmla_adapter.warmup(self.device, self.model_dtype)
+                logger.info(
+                    "Ascend attention: dense MLA decode uses FlashMLA "
+                    "(ENABLE_ASCEND_FLASH_MLA=1)."
+                )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -610,6 +678,11 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        if self.use_flash_mla:
+            # One host read per step; the value only picks the metadata bucket.
+            self.forward_metadata.fmla_max_seqlen_kv = _fmla_kv_bucket(
+                int(forward_batch.seq_lens_cpu.max().item())
+            )
         # New step: eager FlashAttn metadata describes this step's tensors only.
         self._fa_meta_step.clear()
         if (
@@ -813,6 +886,132 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata.fa_metadata = md
         return md
 
+    def _fmla_metadata_for(
+        self,
+        *,
+        bs: int,
+        max_seqlen_kv: int,
+        num_q_heads: int,
+        cache_seqlens: torch.Tensor,
+    ):
+        """FlashMLA scheduling metadata for this batch bucket and head config.
+
+        ``flash_mla_metadata`` is a separate AICPU op (~35us) and carries no
+        layer-dependent state, so it must never be called per layer: one
+        tensor is shared by every attention layer of the step.  Eager steps
+        also share it across steps (keyed by batch bucket), because the result
+        depends only on shapes -- the kernel reads the real lengths from
+        ``cache_seqlens`` at run time.
+
+        Inside a capture the metadata node is recorded exactly once (by the
+        first attention layer) and re-executed on every replay from the
+        graph-owned ``fmla_seqused_kv`` buffer, which the graph metadata step
+        refreshes in place.  Tensors built by the pre-capture warmup are never
+        handed to the capture: the graph must own its outputs' addresses.
+        """
+        key = (bs, max_seqlen_kv, num_q_heads)
+
+        def _build():
+            return fmla_adapter.metadata(
+                num_q_heads,
+                batch_size=bs,
+                max_seqlen_q=1,
+                max_seqlen_kv=max_seqlen_kv,
+                cache_seqlens=cache_seqlens,
+            )
+
+        if not self.graph_mode:
+            md = self._fmla_meta_cache.get(key)
+            if md is None:
+                md = _build()
+                self._fmla_meta_cache[key] = md
+            self.forward_metadata.fmla_metadata = md
+            return md
+
+        entry = self._fmla_meta_graph.get(key)
+        if entry is not None and entry[1]:
+            # Recorded by an earlier layer of this same capture.
+            md = entry[0]
+            self.forward_metadata.fmla_metadata = md
+            return md
+
+        capturing = torch.npu.is_current_stream_capturing()
+        if entry is not None and not capturing:
+            md = entry[0]
+            self.forward_metadata.fmla_metadata = md
+            return md
+
+        md = _build()
+        self._fmla_meta_graph[key] = (md, capturing)
+        if capturing:
+            self._fmla_meta_keep.append(md)
+        self.forward_metadata.fmla_metadata = md
+        return md
+
+    def _fmla_decode(
+        self,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """flash_mla decode for the absorbed latent MLA path.
+
+        ``q`` is q_nope ``(tokens, tp_q_head_num, 512)`` and ``q_rope`` is
+        q_pe ``(tokens, tp_q_head_num, 64)``; the op wants them concatenated
+        per token.  That cat is O(tokens x heads x 576) and lives only for the
+        duration of the call -- the KV cache itself is already stored
+        interleaved, so nothing proportional to the context is copied.
+        """
+        block_tables = self.forward_metadata.block_tables
+        bs = block_tables.shape[0]
+        num_heads = layer.tp_q_head_num
+        seqused = self.forward_metadata.fmla_seqused_kv
+        if seqused is None:
+            seqused = self.forward_metadata.seq_lens[:bs]
+        max_kv = -1
+        if not self.graph_mode:
+            max_kv = self.forward_metadata.fmla_max_seqlen_kv or -1
+        md = self._fmla_metadata_for(
+            bs=bs,
+            max_seqlen_kv=max_kv,
+            num_q_heads=num_heads,
+            cache_seqlens=seqused,
+        )
+        q_full = torch.cat(
+            [
+                q[:bs].reshape(bs, 1, num_heads, self.kv_lora_rank),
+                q_rope[:bs].reshape(bs, 1, num_heads, self.qk_rope_head_dim),
+            ],
+            dim=-1,
+        )
+        k_cache = self.token_to_kv_pool.get_flash_mla_kv_buffer(layer.layer_id)
+        attn_output = fmla_adapter.decode(
+            q_full,
+            k_cache,
+            block_tables,
+            seqused,
+            num_q_heads=num_heads,
+            scale=layer.scaling,
+            max_seqlen_kv=max_kv,
+            md=md,
+        )
+        attn_output = attn_output.reshape(
+            bs, num_heads * self.kv_lora_rank
+        )
+        if bs != num_tokens:
+            attn_output = torch.cat(
+                [
+                    attn_output,
+                    attn_output.new_zeros(
+                        num_tokens - bs, attn_output.shape[-1]
+                    ),
+                ],
+                dim=0,
+            )
+        return attn_output
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
@@ -830,6 +1029,12 @@ class AscendAttnBackend(AttentionBackend):
                 max_bs, dtype=torch.int32, device=self.device
             ),
         }
+        if self.use_flash_mla:
+            # flash_mla rejects a zero KV length; capture fills seq_lens with
+            # 0, so the graph reads this clamped copy (refilled in place).
+            self.graph_metadata["fmla_seqused_kv"] = torch.ones(
+                max_bs, dtype=torch.int32, device=self.device
+            )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -887,6 +1092,8 @@ class AscendAttnBackend(AttentionBackend):
         metadata.seq_lens = seq_lens
         if self.use_flash_attn:
             metadata.fa_seqused_kv = self.graph_metadata["fa_seqused_kv"][:bs]
+        if self.use_flash_mla:
+            metadata.fmla_seqused_kv = self.graph_metadata["fmla_seqused_kv"][:bs]
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -1012,6 +1219,9 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.seq_lens[:bs].clamp(min=1)
             )
             metadata.fa_seqused_kv[bs:].fill_(1)
+        if self.use_flash_mla and metadata.fmla_seqused_kv is not None:
+            metadata.fmla_seqused_kv.copy_(metadata.seq_lens[:bs].clamp(min=1))
+            metadata.fmla_seqused_kv[bs:].fill_(1)
 
         self.forward_metadata = metadata
 
@@ -2816,6 +3026,9 @@ class AscendAttnBackend(AttentionBackend):
             )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
+            if self.use_flash_mla:
+                return self._fmla_decode(q, q_rope, layer, forward_batch, q.shape[0])
+
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
@@ -3242,6 +3455,9 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.use_flash_mla:
+                return self._fmla_decode(q, q_rope, layer, forward_batch, num_tokens)
 
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""

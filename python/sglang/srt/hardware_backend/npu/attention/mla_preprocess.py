@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -18,6 +19,10 @@ if TYPE_CHECKING:
 
 @lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
+    # MLAPO writes the latent KV through two separate cache buffers, which is
+    # incompatible with the single fused 576-wide pool flash_mla needs.
+    if envs.ENABLE_ASCEND_FLASH_MLA.get():
+        return False
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO")
 
 
