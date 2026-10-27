@@ -767,6 +767,40 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buf = buf.view(self.dtype)
         return buf
 
+    def set_unified_mla_kv(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        latent: torch.Tensor,
+        rope: torch.Tensor,
+    ) -> None:
+        """Scatter one step of ``(latent || rope)`` rows into the fused pool.
+
+        Same landing as the fused branch of :meth:`set_kv_buffer`, split out for
+        the MLA prologue kernels: those write their KV themselves but can only
+        address packed 512/64 buffers, so they stage the rows in a scratch first
+        (see ``NPUFusedMLAPreprocess._v3_scratch_cache``).
+        """
+        if not self.flash_mla:
+            raise RuntimeError("set_unified_mla_kv requires the unified MLA KV layout")
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        width = self.kv_lora_rank + self.qk_rope_head_dim
+        merged = torch.cat(
+            [
+                latent.reshape(-1, self.kv_lora_rank),
+                rope.reshape(-1, self.qk_rope_head_dim),
+            ],
+            dim=-1,
+        )
+        if merged.dtype != self.store_dtype:
+            merged = merged.to(self.store_dtype)
+        torch_npu.npu_scatter_nd_update_(
+            self.kv_buffer[layer_id - self.start_layer].view(-1, 1, width),
+            loc.view(-1, 1),
+            merged.view(-1, 1, width),
+        )
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.

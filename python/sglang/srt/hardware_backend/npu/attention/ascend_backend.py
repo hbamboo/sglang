@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
+    is_mlaprolog_v3_enabled,
 )
 from sglang.srt.hardware_backend.npu.attention import (
     flash_attn_adapter as fa_adapter,
@@ -492,7 +493,14 @@ class AscendAttnBackend(AttentionBackend):
             )
             if reason is None and self.speculative_num_draft_tokens is not None:
                 reason = "speculative decode (MTP) is not wired to flash_mla yet"
-            if reason is None and is_mla_preprocess_enabled():
+            if (
+                reason is None
+                and is_mla_preprocess_enabled()
+                and not is_mlaprolog_v3_enabled()
+            ):
+                # Only the legacy int8 prologue writes the split latent/rope
+                # buffers; the ported MlaPrologV3 path stages its KV in a scratch
+                # and lands it through the fused pool (set_unified_mla_kv).
                 reason = "SGLANG_NPU_USE_MLAPO writes the latent KV in two buffers"
             if reason is not None:
                 logger.warning(
