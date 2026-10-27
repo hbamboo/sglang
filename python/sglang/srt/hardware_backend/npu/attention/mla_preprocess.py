@@ -25,6 +25,8 @@ def is_mla_preprocess_enabled() -> bool:
         or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
     ):
         return False
+    # The ported MlaPrologV3 path lives inside the MLAPO prologue, so enabling
+    # it implies the fused prologue (and the save_kv_cache=False handshake).
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO") or is_mlaprolog_v3_enabled()
 
 
