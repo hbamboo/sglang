@@ -1,4 +1,3 @@
-import re
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -173,19 +172,35 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
+                m.v_head_dim,
                 m.quant_config,
             )
-        (
-            q_pe,
-            k_pe,
-            q_nope_out,
-            k_nope,
-            forward_batch,
-            zero_allocator,
-            positions,
-        ) = m.mla_preprocess.forward(
+        prologue = m.mla_preprocess.forward(
             positions, hidden_states, forward_batch, zero_allocator
         )
+        if m.mla_preprocess.uses_mlaprolog():
+            # MLA-prolog operators also return the normalised q_lora and its
+            # dynamic scale; only the DSA indexer consumes them.
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                _q_lora_norm,
+                forward_batch,
+                positions,
+                _dequant_q_norm,
+            ) = prologue
+        else:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = prologue
         topk_indices = None
     else:
         q_lora = None
@@ -570,9 +585,7 @@ def npu_mla_preprocess(
             m.quant_config,
         )
     # mlaprolog does not require additional calculation of q_lora
-    _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(
-        re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore
-    )
+    _is_mlaprolog = m.mla_preprocess.uses_mlaprolog()
     if _is_mlaprolog:
         (
             q_pe,
