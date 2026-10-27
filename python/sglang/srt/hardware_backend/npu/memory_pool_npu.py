@@ -37,6 +37,15 @@ def is_flash_mla_enabled() -> bool:
     return envs.ENABLE_ASCEND_FLASH_MLA.get()
 
 
+def use_unified_mla_kv_layout() -> bool:
+    """One 576-wide latent buffer per layer (needed by flash_mla, and by PD
+    peers of a flash_mla decoder).  Can be enabled on its own for prefill."""
+    return (
+        envs.ENABLE_ASCEND_FLASH_MLA.get()
+        or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
+    )
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,
@@ -587,7 +596,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self.custom_mem_pool = None
 
-        self.flash_mla = is_flash_mla_enabled()
+        self.unified_kv = use_unified_mla_kv_layout()
+        self.flash_mla = self.unified_kv
         kv_width = self.kv_lora_rank + self.qk_rope_head_dim
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             if self.flash_mla:

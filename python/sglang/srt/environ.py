@@ -761,6 +761,11 @@ class Envs:
     # MLA path for prefill (q_nope @ W_UK, latent KV) and calls the op with
     # layout_q=TND + cu_seqlens.  Requires ENABLE_ASCEND_FLASH_MLA=1.
     ENABLE_ASCEND_FLASH_MLA_PREFILL = EnvBool(False)
+    # Use the single 576-wide MLA KV pool layout (latent || rope interleaved)
+    # WITHOUT switching the attention op.  Required on PD-separated prefill
+    # instances so their get_contiguous_buf_infos() matches a flash_mla decode
+    # peer (one pointer per layer); prefill itself can keep FIA.
+    SGLANG_NPU_MLA_UNIFIED_KV = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)

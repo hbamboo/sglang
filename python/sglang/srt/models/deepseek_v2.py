@@ -1916,6 +1916,7 @@ class DeepseekV2AttentionMLA(
         # sink is skipped and the plain set_kv_buffer path is used instead.
         self.use_deepseek_yarn_rope = rope_scaling is not None and not (
             envs.ENABLE_ASCEND_FLASH_MLA.get()
+            or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
             or envs.SGLANG_NPU_DISABLE_YARN_KV_SINK.get()
         )
 

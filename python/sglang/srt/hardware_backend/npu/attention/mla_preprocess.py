@@ -21,7 +21,10 @@ if TYPE_CHECKING:
 def is_mla_preprocess_enabled() -> bool:
     # MLAPO writes the latent KV through two separate cache buffers, which is
     # incompatible with the single fused 576-wide pool flash_mla needs.
-    if envs.ENABLE_ASCEND_FLASH_MLA.get():
+    if (
+        envs.ENABLE_ASCEND_FLASH_MLA.get()
+        or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
+    ):
         return False
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO")
 
