@@ -183,6 +183,61 @@ def test_metadata_reuse():
     return out_stale, out_fresh, ref
 
 
+def ref_extend(q, k_cache, block_table, prefix_lens, q_lens):
+    """Right-aligned causal reference for the TND extend path."""
+    outs = []
+    off = 0
+    for b, (p, l) in enumerate(zip(prefix_lens, q_lens)):
+        total = p + l
+        pages = (total + PAGE - 1) // PAGE
+        blocks = block_table[b, :pages].long()
+        kv = k_cache.index_select(0, blocks).reshape(-1, HEAD_DIM_QK)[:total].float()
+        for i in range(l):
+            k = kv[: p + i + 1]
+            v = k[:, :HEAD_DIM_V]
+            pr = torch.softmax((q[off + i].float() @ k.T) * (1.0 / math.sqrt(HEAD_DIM_QK)), -1)
+            outs.append(pr @ v)
+        off += l
+    return torch.stack(outs)
+
+
+def test_adapter_extend():
+    """TND prefill: prefix + chunk, ragged batch, causal."""
+    torch.manual_seed(3)
+    q_lens = [64, 1, 200]
+    prefix_lens = [768, 5, 3000]
+    total = [p + l for p, l in zip(prefix_lens, q_lens)]
+    nb = 64
+    k_cache = torch.randn(
+        nb, PAGE, 1, HEAD_DIM_QK, dtype=torch.bfloat16, device=DEV
+    )
+    q = torch.randn(
+        sum(q_lens), H, HEAD_DIM_QK, dtype=torch.bfloat16, device=DEV
+    )
+    max_pages = max((t + PAGE - 1) // PAGE for t in total)
+    bt = torch.randint(0, nb, (len(q_lens), max_pages), dtype=torch.int32, device=DEV)
+    cs = torch.tensor(total, dtype=torch.int32, device=DEV)
+    cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(q_lens), 0).tolist()),
+        dtype=torch.int32,
+        device=DEV,
+    )
+    out = fmla.extend(
+        q,
+        k_cache,
+        bt,
+        cs,
+        cu,
+        num_q_heads=H,
+        scale=1.0 / math.sqrt(HEAD_DIM_QK),
+        max_seqlen_q=max(q_lens),
+        max_seqlen_kv=max(total),
+    )
+    torch.npu.synchronize()
+    ref = ref_extend(q, k_cache, bt, prefix_lens, q_lens)
+    return out, ref
+
+
 if __name__ == "__main__":
     print("device:", torch_npu.npu.get_device_name(0))
     out, ref = test_adapter_decode()
@@ -196,3 +251,6 @@ if __name__ == "__main__":
     print("3) stale vs fresh metadata max_abs:", (a - b).abs().max().item())
     print("   stale vs fp32 ref:", err_stats(a, ref2))
     print("   fresh vs fp32 ref:", err_stats(b, ref2))
+
+    out_e, ref_e = test_adapter_extend()
+    print("4) TND extend vs fp32 ref:", err_stats(out_e, ref_e))
