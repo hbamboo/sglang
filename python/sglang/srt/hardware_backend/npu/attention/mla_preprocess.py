@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 
 @lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
-    return get_bool_env_var("SGLANG_NPU_USE_MLAPO")
+    # The ported MlaPrologV3 path lives inside the MLAPO prologue, so enabling
+    # it implies the fused prologue (and the save_kv_cache=False handshake).
+    return get_bool_env_var("SGLANG_NPU_USE_MLAPO") or is_mlaprolog_v3_enabled()
 
 
 @lru_cache(maxsize=1)
@@ -29,6 +31,19 @@ def is_fia_nz() -> bool:
             is_mla_preprocess_enabled()
         ), "SGLANG_USE_FIA_NZ must be enable with SGLANG_NPU_USE_MLAPO"
     return is_fia_nz_
+
+
+@lru_cache(maxsize=1)
+def is_mlaprolog_v3_enabled() -> bool:
+    """Use the ported MlaPrologV3 kernel for the MLA prologue (A/B switch).
+
+    ``SGLANG_NPU_USE_MLAPO_V3=1`` (in addition to ``SGLANG_NPU_USE_MLAPO=1``)
+    replaces the fused int8 ``npu_mla_preprocess`` / the unfused prologue with
+    the MlaPrologV3 operator from sgl-kernel-npu.  It accepts the GLM-4.7-Flash
+    geometry (He=2048, Hcq=768, Hckv=512, D=192, Dr=64, N=20) and either MXFP8
+    (``float8_e4m3`` + per-32 e8m0 scale) or bf16 projections.
+    """
+    return get_bool_env_var("SGLANG_NPU_USE_MLAPO_V3")
 
 
 def round_up(val: int, align: int) -> int:
@@ -99,8 +114,14 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim  # 64
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
-        self.q_b_proj_weight_scale = self.q_b_proj.weight_scale.view(1, -1).to(
-            torch.float
+        # W8A8-int8 checkpoints expose `weight_scale`; an MXFP8 checkpoint keeps
+        # its scale in `weight_scale_inv` (per-block e8m0) and needs no
+        # per-tensor dequant scale here.
+        weight_scale = getattr(self.q_b_proj, "weight_scale", None)
+        self.q_b_proj_weight_scale = (
+            weight_scale.view(1, -1).to(torch.float)
+            if weight_scale is not None
+            else None
         )
 
     def preprocess_weights(self, hidden_states):
@@ -469,6 +490,122 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             dequant_q_norm,
         )
 
+    # ------------------------------------------------------- MlaPrologV3 (ported)
+    def uses_mlaprolog(self) -> bool:
+        """Whether this layer's prologue goes through an MLA-prolog operator.
+
+        Both the ported kernel (``SGLANG_NPU_USE_MLAPO_V3``) and the W8A8-int8
+        ``forward_mlaprolog`` path return the 8-tuple consumed by the callers;
+        everything else returns the legacy 7-tuple.
+        """
+        if is_mlaprolog_v3_enabled():
+            return True
+        return hasattr(self.quant_config, "ignore") and any(
+            re.fullmatch(r".*kv_b_proj", str(entry))
+            for entry in self.quant_config.ignore
+        )
+
+    def _mlaprolog_v3_preprocess_weight(self):
+        """Build the three projection weights in the operator's bf16 + NZ ABI.
+
+        The checkpoint fuses q_a/kv_a into `qkv_a_proj_with_mqa` as [out, in]
+        (or [in, out] for some schemes) and stores MXFP8 pairs, so the fused
+        matrix is dequantised once, split on the output axis and cast to
+        FRACTAL_NZ.  `w_kc` is already the absorbed bf16 [N, D, Hckv] weight.
+        """
+        from sgl_kernel_npu.mla_prolog_v3_compat import dequant_to_in_out, to_nd
+
+        import torch_npu
+
+        def to_nz(t):
+            return torch_npu.npu_format_cast(t.contiguous(), 29)  # FRACTAL_NZ
+
+        def as_bf16_in_out(module):
+            weight = module.weight
+            scale = getattr(module, "weight_scale_inv", None)
+            plain = to_nd(weight.data)
+            out = dequant_to_in_out(
+                weight.data, scale.data if scale is not None else None
+            )
+            if out is None and plain is not None and plain.dtype == torch.bfloat16:
+                out = plain
+            if out is None:
+                raise RuntimeError(
+                    "MlaPrologV3: cannot build a bf16 %s from dtype %s"
+                    % (type(module).__name__, weight.dtype)
+                )
+            return out
+
+        fused = as_bf16_in_out(self.qkv_a_proj)
+        fused_out = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        if fused.shape[1] != fused_out:
+            raise RuntimeError(
+                "MlaPrologV3: fused qkv_a output %d != FQ_KC+KV_KC+ROPE_H=%d"
+                % (fused.shape[1], fused_out)
+            )
+        self.weight_dq = to_nz(fused[:, : self.q_lora_rank])
+        self.weight_dkv_kr = to_nz(fused[:, self.q_lora_rank :])
+        self.weight_uq_qr = to_nz(as_bf16_in_out(self.q_b_proj))
+        self.weight_uk = self.w_kc.contiguous()
+        if self.weight_uk.dtype != torch.bfloat16:
+            self.weight_uk = self.weight_uk.to(torch.bfloat16)
+
+    def forward_mlaprolog_v3(self, positions, hidden_states, forward_batch):
+        """MlaPrologV3 (sgl-kernel-npu) prologue: one kernel for the whole op chain."""
+        if not self.has_preprocess_weights:
+            self._mlaprolog_v3_preprocess_weight()
+            self.has_preprocess_weights = True
+            if get_bool_env_var("SGLANG_NPU_MLAPO_V3_DEBUG"):
+                print(
+                    "[mlaprolog_v3] layer %d weights ready: dq=%s uq_qr=%s uk=%s dkv_kr=%s"
+                    % (
+                        self.layer_id,
+                        tuple(self.weight_dq.shape),
+                        tuple(self.weight_uq_qr.shape),
+                        tuple(self.weight_uk.shape),
+                        tuple(self.weight_dkv_kr.shape),
+                    ),
+                    flush=True,
+                )
+
+        cos, sin = self.get_sin_cos(positions)
+        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
+        page_size = get_attn_backend().page_size
+        kv_cache = k_cache.view(-1, page_size, 1, self.kv_lora_rank)
+        kr_cache = v_cache.view(-1, page_size, 1, self.qk_rope_head_dim)
+
+        q_nope, q_pe, _, q_norm, _ = torch.ops.npu.mla_prolog_v3(
+            token_x=hidden_states,
+            weight_dq=self.weight_dq,
+            weight_uq_qr=self.weight_uq_qr,
+            weight_uk=self.weight_uk,
+            weight_dkv_kr=self.weight_dkv_kr,
+            rmsnorm_gamma_cq=self.q_a_layernorm.weight,
+            rmsnorm_gamma_ckv=self.kv_a_layernorm.weight,
+            rope_sin=sin,
+            rope_cos=cos,
+            kv_cache=kv_cache,
+            kr_cache=kr_cache,
+            cache_index=slot_mapping.to(dtype=torch.int64),
+            rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
+            rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
+            cache_mode="PA_BSND",
+            query_norm_flag=True,
+            weight_quant_mode=0,  # weights are bf16 (dequantised above)
+        )
+        # q_norm is the normalised q_lora: only the DSA indexer consumes it, and
+        # the attention backend already reports save_kv_cache=False for MLAPO.
+        return (
+            q_pe,
+            kr_cache,
+            q_nope,
+            kv_cache,
+            q_norm,
+            forward_batch,
+            positions,
+            None,
+        )
+
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
@@ -481,6 +618,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
             re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
         )
+        if is_mlaprolog_v3_enabled():
+            return self.forward_mlaprolog_v3(
+                positions, hidden_states, forward_batch
+            )
         if _is_w8a8:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
