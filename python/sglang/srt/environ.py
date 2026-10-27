@@ -752,6 +752,11 @@ class Envs:
     # decode on Ascend 950PR/950DT.  Also switches the NPU MLA KV pool to one
     # contiguous 576-wide latent buffer (see flash_mla_adapter.py).
     ENABLE_ASCEND_FLASH_MLA = EnvBool(False)
+    # Force the plain set_kv_buffer write instead of the fused
+    # npu_kv_rmsnorm_rope_cache yarn sink on NPU MLA prefill.  Needed for a
+    # like-for-like A/B against ENABLE_ASCEND_FLASH_MLA (which cannot use the
+    # fused sink because of its interleaved KV pool).
+    SGLANG_NPU_DISABLE_YARN_KV_SINK = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)

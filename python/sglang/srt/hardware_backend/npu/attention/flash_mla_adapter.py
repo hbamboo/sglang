@@ -210,8 +210,8 @@ def decode(
             f"k_cache shape {tuple(k_cache.shape)} is not paged latent "
             f"PA_BBND (..., 1, {head_dim_qk})"
         )
-    block_table = _as_int32(block_table)
-    cache_seqlens = _as_int32(cache_seqlens)
+    block_table = _as_int32(block_table).contiguous()
+    cache_seqlens = _as_int32(cache_seqlens).contiguous()
     if md is None:
         md = metadata(
             num_q_heads,
@@ -264,9 +264,9 @@ def extend(
     ``(bs+1,)`` cumulative query length.  Returns ``(num_tokens, heads, 512)``.
     """
     fm, _ = _ops()
-    block_table = _as_int32(block_table)
-    cache_seqlens = _as_int32(cache_seqlens)
-    cu_seqlens_q = _as_int32(cu_seqlens_q)
+    block_table = _as_int32(block_table).contiguous()
+    cache_seqlens = _as_int32(cache_seqlens).contiguous()
+    cu_seqlens_q = _as_int32(cu_seqlens_q).contiguous()
     if md is None:
         md = metadata(
             num_q_heads,

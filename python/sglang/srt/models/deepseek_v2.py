@@ -1910,7 +1910,14 @@ class DeepseekV2AttentionMLA(
                 self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
         else:
             self.rotary_emb = None
-        self.use_deepseek_yarn_rope = rope_scaling is not None
+        # The fused npu_kv_rmsnorm_rope_cache sink writes the latent / rope
+        # halves through two separate cache buffers.  ENABLE_ASCEND_FLASH_MLA
+        # switches the NPU MLA pool to one interleaved 576-wide buffer, so that
+        # sink is skipped and the plain set_kv_buffer path is used instead.
+        self.use_deepseek_yarn_rope = rope_scaling is not None and not (
+            envs.ENABLE_ASCEND_FLASH_MLA.get()
+            or envs.SGLANG_NPU_DISABLE_YARN_KV_SINK.get()
+        )
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
