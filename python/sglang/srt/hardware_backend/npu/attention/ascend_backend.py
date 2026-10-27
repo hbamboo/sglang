@@ -58,6 +58,12 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
+def is_prefix_kv_dedup_disabled() -> bool:
+    """SGLANG_NPU_DISABLE_PREFIX_KV_DEDUP=1 keeps per-request prefix expansion."""
+    return get_bool_env_var("SGLANG_NPU_DISABLE_PREFIX_KV_DEDUP")
+
+
+@lru_cache(maxsize=1)
 def is_prefill_tnd_enabled() -> bool:
     """SGLANG_NPU_ENABLE_PREFILL_TND=1: one FIA TND call per layer per batch.
 
@@ -163,6 +169,9 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    # (unique_block_ids, token->unique_row_map) for the shared-prefix kv_b_proj
+    # dedup, computed once per step (the block table does not change per layer).
+    prefix_block_dedup: Optional[tuple] = None
 
 
 class AscendAttnMaskBuilder:
@@ -926,6 +935,33 @@ class AscendAttnBackend(AttentionBackend):
             self._fa_meta_keep.append(md)
         self.forward_metadata.fa_metadata = md
         return md
+
+    def _prefix_block_dedup(self, block_ids):
+        """Map prefix blocks to unique-block rows for one prefill batch.
+
+        Returns ``(uniq, row_map)`` or ``(None, None)`` when no two requests
+        share a prefix block.  Cached per step: the block table is built in
+        ``init_forward_metadata`` and is identical for every layer.
+        """
+        cached = self.forward_metadata.prefix_block_dedup
+        if cached is not None:
+            return cached
+        uniq, inverse = torch.unique(block_ids, sorted=True, return_inverse=True)
+        if uniq.numel() == block_ids.numel():
+            result = (None, None)
+        else:
+            if not getattr(self, "_pfx_dedup_logged", False):
+                logger.info(
+                    "prefix KV dedup: %d prefix blocks -> %d unique (%.1fx fewer "
+                    "kv_b_proj rows)",
+                    block_ids.numel(),
+                    uniq.numel(),
+                    block_ids.numel() / max(uniq.numel(), 1),
+                )
+                self._pfx_dedup_logged = True
+            result = (uniq, inverse)
+        self.forward_metadata.prefix_block_dedup = result
+        return result
 
     def _fmla_metadata_for(
         self,
@@ -2306,23 +2342,60 @@ class AscendAttnBackend(AttentionBackend):
 
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                kv_cached = torch.index_select(
-                    k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-                )
-                k_rope_cached = torch.index_select(
-                    v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-                ).flatten(0, 1)
-
+                block_ids = self.forward_metadata.flatten_prefix_block_tables
                 assert layer.kv_b_proj is not None
-                kv = layer.kv_b_proj(kv_cached)[0].view(
-                    -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
-                )
-                k_nope, v_pre = kv.split(
-                    [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
-                )
 
-                k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-                k_pre = torch.cat([k_nope, k_rope], dim=-1)
+                inverse = None
+                if is_prefix_kv_dedup_disabled():
+                    uniq = None
+                else:
+                    uniq, inverse = self._prefix_block_dedup(block_ids)
+
+                if uniq is not None:
+                    # Expand the *unique* prefix blocks once (shared system
+                    # prompt is the same physical pages for every request),
+                    # then rebuild the per-request prefix at block granularity
+                    # with the same index_select the non-dedup path uses.
+                    kv = layer.kv_b_proj(
+                        k_buffer[uniq].reshape(-1, self.kv_lora_rank)
+                    )[0].view(
+                        -1,
+                        layer.tp_k_head_num,
+                        self.qk_nope_head_dim + layer.v_head_dim,
+                    )
+                    k_nope, v_u = kv.split(
+                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+                    )
+                    k_rope = v_buffer[uniq].reshape(-1, self.qk_rope_head_dim)
+                    k_rope = k_rope.unsqueeze(1).expand(
+                        -1, layer.tp_k_head_num, -1
+                    )
+                    k_u = torch.cat([k_nope, k_rope], dim=-1)
+                    shaped = (
+                        -1,
+                        self.page_size,
+                        layer.tp_k_head_num,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    )
+                    k_pre = torch.index_select(k_u.view(shaped), 0, inverse)
+                    k_pre = k_pre.reshape(-1, layer.tp_k_head_num, k_u.shape[-1])
+                    v_pre = torch.index_select(v_u.view(shaped), 0, inverse)
+                    v_pre = v_pre.reshape(-1, layer.tp_k_head_num, v_u.shape[-1])
+                else:
+                    kv_cached = torch.index_select(k_buffer, 0, block_ids)
+                    k_rope_cached = torch.index_select(
+                        v_buffer, 0, block_ids
+                    ).flatten(0, 1)
+                    kv = layer.kv_b_proj(kv_cached)[0].view(
+                        -1,
+                        layer.tp_k_head_num,
+                        self.qk_nope_head_dim + layer.v_head_dim,
+                    )
+                    k_nope, v_pre = kv.split(
+                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+                    )
+                    k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
+                    k_pre = torch.cat([k_nope, k_rope], dim=-1)
 
                 attn_output = torch.empty(
                     (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
