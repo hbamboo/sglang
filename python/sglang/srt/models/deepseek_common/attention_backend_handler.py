@@ -1,3 +1,4 @@
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -72,6 +73,12 @@ def handle_attention_ascend(attn, forward_batch):
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
+        if (
+            envs.ENABLE_ASCEND_FLASH_MLA_PREFILL.get()
+            and getattr(get_attn_backend(), "use_flash_mla_prefill", False)
+        ):
+            # absorbed MLA prefill: the backend feeds flash_mla TND directly
+            return AttnForwardMethod.MLA_NPU
         if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         else:

@@ -58,6 +58,12 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
+def is_prefill_tnd_disabled() -> bool:
+    """SGLANG_NPU_DISABLE_PREFILL_TND=1 keeps the per-request FIA loop."""
+    return get_bool_env_var("SGLANG_NPU_DISABLE_PREFILL_TND")
+
+
+@lru_cache(maxsize=1)
 def is_qkv_norm_rope_opt() -> bool:
     """ENABLE_QKV_NORM_ROPE_OPT: KV cache 由 qkv_rms_norm_rope_cache 按 PA_NZ 布局写入。"""
     return get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT")
@@ -142,6 +148,9 @@ class ForwardMetadata:
     fmla_seqused_kv: Optional[torch.Tensor] = None
     fmla_metadata: Optional[torch.Tensor] = None
     fmla_max_seqlen_kv: Optional[int] = None
+    # prefill (TND) shapes for ENABLE_ASCEND_FLASH_MLA_PREFILL
+    fmla_cu_seqlens_q: Optional[torch.Tensor] = None
+    fmla_max_seqlen_q: Optional[int] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -458,6 +467,9 @@ class AscendAttnBackend(AttentionBackend):
         self._fmla_meta_cache = {}
         self._fmla_meta_graph = {}
         self._fmla_meta_keep = []
+        # Prefill metadata depends on cu_seqlens values, so it is rebuilt per
+        # step (one tensor shared by all layers of that step).
+        self._fmla_meta_prefill = {}
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -505,6 +517,14 @@ class AscendAttnBackend(AttentionBackend):
                     "Ascend attention: dense MLA decode uses FlashMLA "
                     "(ENABLE_ASCEND_FLASH_MLA=1)."
                 )
+        self.use_flash_mla_prefill = (
+            self.use_flash_mla and envs.ENABLE_ASCEND_FLASH_MLA_PREFILL.get()
+        )
+        if self.use_flash_mla_prefill:
+            logger.info(
+                "Ascend attention: MLA prefill also uses FlashMLA "
+                "(ENABLE_ASCEND_FLASH_MLA_PREFILL=1)."
+            )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -684,6 +704,21 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.fmla_max_seqlen_kv = _fmla_kv_bucket(
                 int(forward_batch.seq_lens_cpu.max().item())
             )
+        self._fmla_meta_prefill.clear()
+        if (
+            self.use_flash_mla_prefill
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            ext = forward_batch.extend_seq_lens_cpu
+            self.forward_metadata.fmla_cu_seqlens_q = torch.tensor(
+                [0] + [int(v) for v in np.cumsum(ext).tolist()],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.forward_metadata.fmla_max_seqlen_q = int(np.max(ext))
         # New step: eager FlashAttn metadata describes this step's tensors only.
         self._fa_meta_step.clear()
         if (
@@ -948,6 +983,91 @@ class AscendAttnBackend(AttentionBackend):
             self._fmla_meta_keep.append(md)
         self.forward_metadata.fmla_metadata = md
         return md
+
+    def _fmla_prefill_metadata_for(
+        self, *, bs, max_q, max_kv, num_q_heads, cache_seqlens, cu_seqlens_q
+    ):
+        """TND metadata for one prefill step (cu_seqlens-dependent -> per step)."""
+        key = (bs, max_q, max_kv, num_q_heads)
+        md = self._fmla_meta_prefill.get(key)
+        if md is None:
+            md = fmla_adapter.metadata(
+                num_q_heads,
+                batch_size=bs,
+                max_seqlen_q=max_q,
+                max_seqlen_kv=max_kv,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                mask_mode=fmla_adapter.MASK_MODE_CAUSAL,
+                layout_q=fmla_adapter.LAYOUT_RAGGED,
+            )
+            self._fmla_meta_prefill[key] = md
+        self.forward_metadata.fmla_metadata = md
+        return md
+
+    def _fmla_extend(
+        self,
+        q,
+        q_rope,
+        k,
+        k_rope,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        save_kv_cache: bool,
+    ):
+        """flash_mla prefill/extend for the absorbed MLA path.
+
+        The caller (forced MLA_NPU dispatch) already computed the absorbed
+        q_nope (512) + q_pe (64) and the latent k_nope (512) + k_pe (64).
+        """
+        num_tokens = q.shape[0]
+        if save_kv_cache:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
+        real = forward_batch.num_token_non_padded_cpu
+        if real is None:
+            real = num_tokens
+        num_heads = layer.tp_q_head_num
+        cu = self.forward_metadata.fmla_cu_seqlens_q
+        max_q = self.forward_metadata.fmla_max_seqlen_q
+        bs = cu.numel() - 1
+        seqused = self.forward_metadata.seq_lens[:bs]
+        max_kv = self.forward_metadata.fmla_max_seqlen_kv or -1
+        md = self._fmla_prefill_metadata_for(
+            bs=bs,
+            max_q=max_q,
+            max_kv=max_kv,
+            num_q_heads=num_heads,
+            cache_seqlens=seqused,
+            cu_seqlens_q=cu,
+        )
+        q_full = torch.cat(
+            [
+                q[:real].reshape(real, num_heads, self.kv_lora_rank),
+                q_rope[:real].reshape(real, num_heads, self.qk_rope_head_dim),
+            ],
+            dim=-1,
+        )
+        k_cache = self.token_to_kv_pool.get_flash_mla_kv_buffer(layer.layer_id)
+        out = fmla_adapter.extend(
+            q_full,
+            k_cache,
+            self.forward_metadata.block_tables,
+            seqused,
+            cu,
+            num_q_heads=num_heads,
+            scale=layer.scaling,
+            max_seqlen_q=max_q,
+            max_seqlen_kv=max_kv,
+            md=md,
+        )
+        out = out.reshape(real, num_heads * self.kv_lora_rank)
+        if real != num_tokens:
+            out = torch.cat(
+                [out, out.new_zeros(num_tokens - real, out.shape[-1])], dim=0
+            )
+        return out
 
     def _fmla_decode(
         self,
@@ -2168,6 +2288,10 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif self.use_flash_mla_prefill:
+            return self._fmla_extend(
+                q, q_rope, k, k_rope, layer, forward_batch, save_kv_cache
+            )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
@@ -2200,6 +2324,68 @@ class AscendAttnBackend(AttentionBackend):
                     device=q.device,
                     dtype=q.dtype,
                 )
+                if (
+                    layer.tp_q_head_num == layer.tp_k_head_num
+                    and not is_prefill_tnd_disabled()
+                ):
+                    # Pack per-request (prefix || chunk) K/V and run the whole
+                    # prefill batch as one TND kernel.  sparse_mode=3
+                    # right-aligns the causal mask per request, which is the
+                    # prefix+chunk semantics the loop below implements.
+                    q_lens = self.forward_metadata.extend_seq_lens_cpu_int.tolist()
+                    p_lens = self.forward_metadata.prefix_lens.tolist()
+                    k_parts, v_parts = [], []
+                    cu_q, cu_kv = [], []
+                    q_off = p_off = tq = tk = 0
+                    for q_len, p_len in zip(q_lens, p_lens):
+                        if q_len == 0:
+                            continue
+                        k_parts.append(k_pre[p_off : p_off + p_len])
+                        k_parts.append(k[q_off : q_off + q_len])
+                        v_parts.append(v_pre[p_off : p_off + p_len])
+                        v_parts.append(v[q_off : q_off + q_len])
+                        tq += q_len
+                        tk += p_len + q_len
+                        cu_q.append(tq)
+                        cu_kv.append(tk)
+                        q_off += q_len
+                        p_off += p_len
+                    if k_parts:
+                        k_packed = torch.cat(k_parts, dim=0)
+                        v_packed = torch.cat(v_parts, dim=0)
+                        attn_output = torch.ops.npu.npu_fused_infer_attention_score(
+                            q[:tq],
+                            k_packed,
+                            v_packed,
+                            num_heads=layer.tp_q_head_num,
+                            num_key_value_heads=layer.tp_k_head_num,
+                            input_layout="TND",
+                            atten_mask=self.fia_mask,
+                            sparse_mode=3,
+                            actual_seq_lengths=cu_q,
+                            actual_seq_lengths_kv=cu_kv,
+                            scale=layer.scaling,
+                            next_tokens=0,
+                        )[0]
+                        attn_output = attn_output.reshape(
+                            -1, layer.tp_q_head_num, layer.v_head_dim
+                        )
+                        if attn_output.shape[0] != q.size(0):
+                            attn_output = torch.cat(
+                                [
+                                    attn_output,
+                                    attn_output.new_zeros(
+                                        q.size(0) - attn_output.shape[0],
+                                        *attn_output.shape[1:],
+                                    ),
+                                ],
+                                dim=0,
+                            )
+                        attn_output = attn_output.view(
+                            -1, layer.tp_q_head_num * layer.v_head_dim
+                        )
+                        return attn_output
+
                 q_len_offset = 0
                 prefix_len_offset = 0
                 for q_len, prefix_len in zip(
@@ -2345,6 +2531,48 @@ class AscendAttnBackend(AttentionBackend):
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                if (
+                    layer.tp_q_head_num == layer.tp_k_head_num
+                    and self.forward_metadata.seq_lens_list_cumsum is not None
+                    and not is_prefill_tnd_disabled()
+                ):
+                    # One TND kernel for the whole prefill batch (no prefix).
+                    # TND needs q_heads == kv_heads, which holds for this
+                    # MHA-shaped MLA path.
+                    cu = self.forward_metadata.seq_lens_list_cumsum
+                    total_q = cu[-1]
+                    num_token_padding = q.shape[0]
+                    attn_output = torch.ops.npu.npu_fused_infer_attention_score(
+                        q[:total_q],
+                        k[:total_q],
+                        v[:total_q].contiguous(),
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        atten_mask=self.fia_mask,
+                        sparse_mode=3,
+                        actual_seq_lengths=cu,
+                        actual_seq_lengths_kv=cu,
+                        scale=layer.scaling,
+                        next_tokens=0,
+                    )[0]
+                    attn_output = attn_output.reshape(
+                        -1, layer.tp_q_head_num, layer.v_head_dim
+                    )
+                    if attn_output.shape[0] != num_token_padding:
+                        attn_output = torch.cat(
+                            [
+                                attn_output,
+                                attn_output.new_zeros(
+                                    num_token_padding - attn_output.shape[0],
+                                    *attn_output.shape[1:],
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    return attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
                 attn_output = torch.empty(
                     (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
                     device=q.device,

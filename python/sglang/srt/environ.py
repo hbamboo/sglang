@@ -757,6 +757,10 @@ class Envs:
     # like-for-like A/B against ENABLE_ASCEND_FLASH_MLA (which cannot use the
     # fused sink because of its interleaved KV pool).
     SGLANG_NPU_DISABLE_YARN_KV_SINK = EnvBool(False)
+    # Also run MLA *prefill* (extend) through flash_mla: forces the absorbed
+    # MLA path for prefill (q_nope @ W_UK, latent KV) and calls the op with
+    # layout_q=TND + cu_seqlens.  Requires ENABLE_ASCEND_FLASH_MLA=1.
+    ENABLE_ASCEND_FLASH_MLA_PREFILL = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
