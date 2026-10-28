@@ -137,11 +137,21 @@ class Glm4MoeLiteMLP(nn.Module):
         x,
         forward_batch=None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        # ``x`` is a bf16 tensor, or the fused AddRmsNorm+DynamicQuant result
+        # ``(quant, block_scale)`` when the preceding norm folded its output
+        # quantisation in. The MXFP8 linear accepts both, so only the
+        # token-count guard has to look through the tuple.
+        num_tokens = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+        if (self.tp_size == 1) and num_tokens == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        # ``quant_linear`` lets the activation fold the per-token MXFP8
+        # quantisation of its own output into the SwiGLU kernel
+        # (``npu_swiglu_mx_quant``), so ``down_proj`` consumes a
+        # ``(quant, scale)`` tuple instead of re-quantising a bf16 tensor.
+        # Backends without that fusion ignore the argument.
+        x = self.act_fn(gate_up, quant_linear=self.down_proj)
         x, _ = self.down_proj(x)
         return x
 
@@ -608,6 +618,68 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
+        # Consumers that may take a pre-quantised (quant, scale) tuple from the
+        # fused AddRmsNorm+DynamicQuant kernels (SGLANG_NPU_FUSED_*_QUANT).
+        self._npu_attn_quant_linear = self._select_npu_attn_quant_linear()
+        # Only the dense (non-MoE) MLP is a single MXFP8 linear consumer of the
+        # post-attention norm. A sparse block also feeds the fp32 router and the
+        # bf16 expert-dispatch path from the same activation, so it must keep
+        # the bf16 output.
+        self._npu_mlp_quant_linear = getattr(self.mlp, "gate_up_proj", None)
+
+    def _select_npu_attn_quant_linear(self):
+        """The linear that consumes ``input_layernorm``'s output, or None.
+
+        ``prepare_attn`` forwards this to the norm, which may then return the
+        already-quantised ``(quant, scale)`` tuple instead of a bf16
+        activation. That producer/consumer contract only holds when the norm
+        output has exactly one MXFP8 linear consumer, which on the MLA prologue
+        means the packed qkv-a projection. ``prepare_qkv_latent`` feeds it
+        straight into ``fused_qkv_a_proj_with_mqa``, and
+        ``DeepseekV2AttentionMLA.forward_prepare`` already short-circuits a
+        tuple input against ``input_scattered``/empty batches.
+
+        The exceptional paths keep the bf16 norm output:
+
+        * the fused MLAPO prologue (``npu_mla_preprocess`` / ``mla_prolog_v3``)
+          reads the raw activation;
+        * the DSA indexer also reads the raw activation;
+        * a checkpoint with unpacked ``q_a_proj`` / ``kv_a_proj_with_mqa`` feeds
+          two separate linears, so no single consumer exists;
+        * ``fused_qkv_a_proj_with_mqa`` is a ``ReplicatedLinear`` (replicated,
+          not sharded) and therefore carries no ``tp_size``; gate on the
+          attention TP size explicitly instead of relying on that absence.
+        """
+        if not _is_npu:
+            return None
+        attn = self.self_attn
+        if getattr(attn, "use_dsa", False):
+            return None
+        if getattr(attn, "q_lora_rank", None) is None:
+            return None
+        if hasattr(attn, "q_a_proj"):
+            return None
+        fused_qkv_a = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+        if fused_qkv_a is None:
+            return None
+        # The fused kernel writes one (quant, scale) pair for the whole
+        # activation, so only use it when the norm sees the full token block.
+        # ``attn_tp_size`` is derived from the process groups; when those are
+        # not up yet (model introspection, unit tests) stay on the bf16 path.
+        try:
+            attn_tp_size = get_parallel().attn_tp_size
+        except RuntimeError:
+            return None
+        if attn_tp_size != 1:
+            return None
+        from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+            is_mla_preprocess_enabled,
+        )
+
+        if is_mla_preprocess_enabled():
+            return None
+        return fused_qkv_a
+
     def _detect_gfx95_quant_format(self) -> str:
         from sglang.srt.models.deepseek_common.utils import _is_gfx95_supported
 
@@ -644,6 +716,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             residual,
             forward_batch,
             getattr(self, "_gfx95_quant_format", ""),
+            # Fuse add+RMSNorm+MXFP8 quant for the attention input when the
+            # norm result flows into a single MXFP8 linear.
+            quant_linear=self._npu_attn_quant_linear,
         )
 
         hidden_states = self.self_attn(
@@ -658,7 +733,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            # Fuse add+RMSNorm+MXFP8 quant for the MLP input. None on MoE
+            # layers, where the router and expert dispatch need bf16.
+            quant_linear=self._npu_mlp_quant_linear,
         )
 
         fuse_mlp_allreduce = (
