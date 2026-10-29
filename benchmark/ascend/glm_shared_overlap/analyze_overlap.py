@@ -9,11 +9,12 @@ from decimal import Decimal
 parser=argparse.ArgumentParser()
 parser.add_argument('--customer', action='store_true')
 parser.add_argument('--optimized-prefix')
+parser.add_argument('--results-dir',type=pathlib.Path)
 args=parser.parse_args()
 suffix='-customer' if args.customer else ''
 
 ROOT = pathlib.Path(__file__).parent
-RESULTS = ROOT / 'results'
+RESULTS = args.results_dir or ROOT / 'results'
 profiles = {}
 for variant in ['baseline', 'optimized']:
     prefix=args.optimized_prefix if variant=='optimized' and args.optimized_prefix else variant+suffix
