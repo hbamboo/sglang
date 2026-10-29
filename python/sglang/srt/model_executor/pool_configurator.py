@@ -168,6 +168,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._expanded_prefill_kv = envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get()
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -262,6 +263,29 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
 
+        expanded_geometry = None
+        if envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get():
+            if (
+                not str(kvc.device).startswith("npu")
+                or not kvc.use_mla_backend
+                or get_disagg().disaggregation_mode != "prefill"
+                or is_deepseek_dsa(model_config.hf_config)
+                or kv_cache_dtype not in (torch.bfloat16, torch.float16)
+                or dcp_size != 1
+                or get_parallel().attn_cp_size != 1
+                or not kvc.spec_algorithm.is_none()
+                or get_memory().enable_hierarchical_cache
+            ):
+                raise ValueError(
+                    "SGLANG_NPU_PREFILL_EXPANDED_KV requires dense NPU MLA PD prefill, "
+                    "BF16/FP16 KV, CP=1, and no speculation or hierarchical cache"
+                )
+            from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
+                expanded_kv_geometry,
+            )
+
+            expanded_geometry = expanded_kv_geometry(model_config, tp_size)
+
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -275,6 +299,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
+            if expanded_geometry is not None:
+                # Both latent (PD transfer) and expanded (P attention) caches
+                # share token slots and must fit the same memory budget.
+                cell_size += expanded_geometry.width * effective_num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -427,6 +455,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if getattr(self, "_expanded_prefill_kv", False):
+            # NPU pools allocate one extra physical page for the dummy slot.
+            available_bytes -= self._cell_size * page_size
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
