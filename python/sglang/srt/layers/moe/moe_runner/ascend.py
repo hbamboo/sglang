@@ -198,6 +198,16 @@ class AscendRunnerCore(MoeRunnerCore):
                     hidden_states
                 )
 
+        # The context belongs to this exact layer/forward and is absent for
+        # every other model, quantization, dispatcher and decode path.
+        from sglang.srt.hardware_backend.npu.moe.shared_expert_overlap import (
+            get_shared_expert_overlap,
+        )
+
+        shared_overlap = get_shared_expert_overlap(self.config.layer)
+        if shared_overlap is not None:
+            shared_overlap.before_gmm2()
+
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -208,6 +218,8 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
+        if shared_overlap is not None:
+            shared_overlap.after_gmm2()
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 

@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     add_prefix,
     is_non_idle_and_non_empty,
     is_npu,
+    get_bool_env_var,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -290,6 +291,11 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 else None
             )
 
+        self._npu_shared_overlap_enabled = _is_npu and get_bool_env_var(
+            "SGLANG_NPU_SHARED_EXPERT_OVERLAP"
+        )
+        self._npu_shared_overlap = None
+
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
@@ -310,6 +316,14 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if self._npu_shared_overlap_enabled:
+            from sglang.srt.hardware_backend.npu.moe.shared_expert_overlap import (
+                can_overlap_shared_expert,
+            )
+
+            if can_overlap_shared_expert(self, hidden_states, forward_batch):
+                return self.forward_npu_shared_overlap(hidden_states)
+
         if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
@@ -322,6 +336,27 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_npu_shared_overlap(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.hardware_backend.npu.moe.shared_expert_overlap import (
+            SharedExpertOverlap,
+            shared_expert_overlap_context,
+        )
+
+        if self._npu_shared_overlap is None:
+            self._npu_shared_overlap = SharedExpertOverlap(self.experts, self.shared_experts)
+        overlap = self._npu_shared_overlap
+        # Avoid competing with the router GEMM; gate/up starts with top-k.
+        router_logits = self.gate(hidden_states)
+        with shared_expert_overlap_context(overlap):
+            overlap.start(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            final_hidden_states *= self.routed_scaling_factor
+            shared_output = overlap.finish()
+            final_hidden_states_out = torch.empty_like(final_hidden_states)
+            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+        return final_hidden_states_out
 
     def forward_normal_dual_stream(
         self,

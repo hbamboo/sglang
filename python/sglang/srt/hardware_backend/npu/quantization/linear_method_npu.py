@@ -276,6 +276,27 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
+        return self.apply_quantized(
+            layer, qx, input_scale, original_dtype, bias=bias, input_shape=input_shape
+        )
+
+    def apply_quantized(
+        self,
+        layer: torch.nn.Module,
+        qx: torch.Tensor,
+        input_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+        input_shape=None,
+    ) -> torch.Tensor:
+        """Consume MXFP8 activations without quantizing them a second time.
+
+        This separates activation/quantization from down projection so the
+        shared-expert pipeline can schedule them against different MoE stages.
+        Weight layout, scales, bias and output rounding match apply().
+        """
+        if input_shape is None:
+            input_shape = qx.shape
         # MXFP8 matmul (weight & scale already transposed at load time)
         # Use the cached FP32 bias from process_weights_after_loading; fall back
         # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
@@ -298,7 +319,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             pertoken_scale=input_scale,
             pertoken_scale_dtype=e8m0_dtype,
             bias=quant_bias,
-            output_dtype=original_dtype,
+            output_dtype=output_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
         )
 
