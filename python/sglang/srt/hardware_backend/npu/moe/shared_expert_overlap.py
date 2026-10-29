@@ -96,10 +96,12 @@ class SharedExpertOverlap:
         self.experts = experts
         self.shared = shared
         self.prequant = prequant
+        self.force_main = get_bool_env_var("SGLANG_NPU_SHARED_EXPERT_OVERLAP_FORCE_MAIN")
+        self._reported_main = None
         # Diagnostic only: preserve stages while removing the side stream.
         self.stream = (
             torch.npu.current_stream()
-            if get_bool_env_var("SGLANG_NPU_SHARED_EXPERT_OVERLAP_FORCE_MAIN")
+            if self.force_main
             else _shared_stream(torch.npu.current_device(), cube_cores, vector_cores)
         )
         self.input_ready = torch.npu.Event()
@@ -119,6 +121,12 @@ class SharedExpertOverlap:
         return torch.profiler.record_function(name) if self.annotate else nullcontext()
 
     def prepare(self, hidden_states):
+        if self.force_main:
+            self.stream = torch.npu.current_stream()
+            assert self.stream == torch.npu.current_stream()
+            if self._reported_main != self.stream:
+                print("NPU_FORCE_MAIN_DIAG", "main=" + str(torch.npu.current_stream()), "side=" + str(self.stream), "equal=True", flush=True)
+                self._reported_main = self.stream
         """Quantize shared input while the main stream computes router logits."""
         if not self.prequant or self.main is not None:
             raise RuntimeError("Shared input prepare requires an idle prequant pipeline")
@@ -134,6 +142,12 @@ class SharedExpertOverlap:
         self.stage = -1
 
     def start(self, hidden_states):
+        if self.force_main:
+            self.stream = torch.npu.current_stream()
+            assert self.stream == torch.npu.current_stream()
+            if self._reported_main != self.stream:
+                print("NPU_FORCE_MAIN_DIAG", "main=" + str(torch.npu.current_stream()), "side=" + str(self.stream), "equal=True", flush=True)
+                self._reported_main = self.stream
         if self.prequant:
             if self.stage != -1 or self.main != torch.npu.current_stream():
                 raise RuntimeError("Shared gate/up must follow prepare on the same caller stream")
