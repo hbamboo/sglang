@@ -1,0 +1,92 @@
+{
+  "baseline": {
+    "prefix": "baseline-expandable-customer",
+    "request_passes": 5,
+    "discarded": 2,
+    "groups": [
+      {
+        "tokens": 1606,
+        "instances": 138,
+        "module_median_us": 1209.7504999996163,
+        "module_mean_us": 1234.6795507246406,
+        "true_overlap_counts": [
+          0,
+          0,
+          0
+        ],
+        "median_overlap_pct": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "init_mean_us": 78.88610869565217,
+        "gmm2_mean_us": 105.29640579710144,
+        "finalize_mean_us": 20.69176086956522
+      },
+      {
+        "tokens": 30861,
+        "instances": 138,
+        "module_median_us": 6393.133499999996,
+        "module_mean_us": 6393.837666666633,
+        "true_overlap_counts": [
+          0,
+          0,
+          0
+        ],
+        "median_overlap_pct": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "init_mean_us": 1377.0781014492754,
+        "gmm2_mean_us": 955.8802246376812,
+        "finalize_mean_us": 342.5068405797101
+      }
+    ]
+  },
+  "optimized": {
+    "prefix": "optimized-selective-customer",
+    "request_passes": 5,
+    "discarded": 2,
+    "groups": [
+      {
+        "tokens": 1606,
+        "instances": 138,
+        "module_median_us": 1281.0550000001676,
+        "module_mean_us": 1266.497492753644,
+        "true_overlap_counts": [
+          0,
+          0,
+          0
+        ],
+        "median_overlap_pct": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "init_mean_us": 78.63511594202899,
+        "gmm2_mean_us": 105.37983333333334,
+        "finalize_mean_us": 20.640115942028984
+      },
+      {
+        "tokens": 30861,
+        "instances": 138,
+        "module_median_us": 5794.706499999855,
+        "module_mean_us": 5794.489384057961,
+        "true_overlap_counts": [
+          138,
+          138,
+          138
+        ],
+        "median_overlap_pct": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "init_mean_us": 1446.737152173913,
+        "gmm2_mean_us": 1057.1124492753622,
+        "finalize_mean_us": 403.5932536231884
+      }
+    ]
+  }
+}

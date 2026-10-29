@@ -7,6 +7,22 @@ Enable with `SGLANG_NPU_SHARED_EXPERT_OVERLAP=1`; the default is off. The path r
 
 The optional `SGLANG_NPU_SHARED_EXPERT_OVERLAP_ANNOTATE=1` emits CPU profiler ranges. It is not enabled in timed comparisons.
 
+The selected customer-workload configuration is:
+
+```bash
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_NPU_SHARED_EXPERT_OVERLAP=1
+export SGLANG_NPU_SHARED_EXPERT_OVERLAP_MIN_TOKENS=8192
+```
+
+Use the same allocator setting in the baseline, with the overlap flag set to 0.
+The token threshold applies to each actual prefill invocation, including scheduler
+tails. Below it, the original serial MLP runs. The threshold defaults to 0 for
+compatibility; decode and unsupported paths always use the original path.
+Leave `SGLANG_NPU_SHARED_EXPERT_OVERLAP_PREQUANT=0` and stream cube/vector limits
+at -1. The measured alternatives did not consistently beat the original three
+stages. `TUNING_ROUND2.md` contains all candidate results and their limits.
+
 ## Device schedule
 
 | Main stream | Shared stream |
@@ -33,7 +49,7 @@ The primary workload is the user's `/mnt/sfs_turbo/hxd/CHAT-mxfp8-customer-2000.
 
 `benchmark.py` is a separate single-request microbenchmark: exactly 32768 input token IDs and one output token. Its results must not be substituted for the multi-request customer-workload result. Both clients measure the first SSE packet containing a generated token and check zero cached tokens. Profiler runs are separate from timed runs.
 
-`gsm8k_eval.py` evaluates all 1319 GSM8K test questions, with four fixed examples from the train split, greedy sampling, up to 8192 generated tokens, 16 concurrent requests and the installed EvalScope answer parser/scorer. Every response, prompt hash, finish reason and score is retained. Baseline and optimized runs must use identical prompts and settings; compare per-question answers as well as aggregate accuracy and truncation.
+`gsm8k_eval.py` evaluates all 1319 GSM8K test questions, with four fixed examples from the train split, greedy sampling, up to 8192 generated tokens and the installed EvalScope answer parser/scorer. Every response, prompt hash, finish reason and score is retained. The original partial journals used concurrency 16 without decode graphs. The final paired evaluation uses `--parallel 32` with identical full decode graphs in both services; prefill graphs remain disabled so the changed prefill path executes. Final journals are separate from the old partial runs. Baseline and optimized runs must use identical prompts and settings; compare per-question answers as well as aggregate accuracy and truncation. Quality-run latency is not a customer TTFT measurement.
 
 `run_customer_validation.py` orchestrates the primary customer-workload performance and profiling comparisons, then the full GSM8K baseline and optimized runs. `run_validation.py` contains server/job helpers and the original microbenchmark workflow. They use localhost port 19255 on physical NPU 5 and only terminate server process groups they created after verifying the command line. Progress is recorded atomically in `validation-state.json`; inspect the live process before restarting anything. GSM8K `--resume` preserves completed records in the same variant's JSONL journal.
 
