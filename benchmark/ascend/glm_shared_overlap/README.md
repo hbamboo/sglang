@@ -63,8 +63,10 @@ it checks all 1319 questions, references, prompt hashes, completion reasons,
 truncation and summary counts, then recomputes 2638 EvalScope scores.
 `record_provenance.py` records package/data/config hashes and verifies that the
 pre-existing runtime patch remains byte-identical. `build_delivery.py` bundles
-the completed audits, raw results, launch configurations, sources and Git patch;
-the large profiling ZIP stays separate and is referenced by checksum.
+text-free numeric audits, per-case equality flags, sources and the Git patch;
+the large profiling ZIP stays separate and is referenced by checksum. Detailed
+responses, logs and launch configurations stay in the remote result directory.
+`export_audit_summary.py` creates the summary using explicit field whitelists.
 
 After the task releases its service, `bash reproduce_server.sh baseline perf`
 or `bash reproduce_server.sh optimized perf` starts the exact controlled
@@ -75,3 +77,12 @@ directories and preserve both full journals. These commands only use NPU 5
 and do not stop other processes.
 
 Results and full profiling are written to `/mnt/paas/hxdnpu/glm-shared-overlap-20261030`. Performance and quality conclusions require the completed result files, not only a passing unit test or an enabled environment flag.
+
+## Final measured result
+
+Two opposite-order, fresh-service customer comparisons reduced mean TTFT by
+4.122% and 2.003%, and P95 by 3.227% and 2.278%. No outliers were excluded.
+Both full GSM8K runs scored 1170/1319 (88.7036%), with the same 15 truncated
+samples. All 1319 prompt hashes, predicted answers and full response texts
+matched. Independent reference-based rescoring checked all 2638 responses.
+See `PERFORMANCE_STATUS.md` for the full scope, raw-data locations and limits.

@@ -28,7 +28,7 @@ flowchart LR
 - P0（既有三阶段）：Router 后共享流执行 input quant + gate/up；其后两个共享阶段分别等 GMM1、GMM2。
 - P1（提前量化）：input quant 与 Router 并行，gate/up GEMM 仍等 Router 后与 TopK/init 并行；激活和 down 仍严格保持用户指定的后两阶段。
 - C2（实施强度，不是新 DAG）：对共享流施加 cube/vector 上限；主流不设限，因此不是固定主副流硬件分区。
-- 选择器：可按 prefill token 数设门槛，小输入可回到原串行实现。默认门槛为 0，本轮尚未选择新的默认值。
+- 选择器：可按 prefill token 数设门槛，小输入可回到原串行实现。代码默认门槛为 0，本轮推荐显式设置 8192。
 
 执行所有候选前检查作用域、事件顺序与 tensor 生命周期。输入/输出继续使用 record_stream，权重常驻；没有为了减少分配开销删除内存安全同步。
 
@@ -83,3 +83,5 @@ P0 平均 TTFT 降低 3.458%，246/248 组变快；门槛版本降低 4.122%，2
 `analyze_moe_windows.py` 从实际 AddRmsNorm 结束到最终 shared+routed Add 结束重建 MLP 窗口，并按交集 / min(两侧窗口) 计算重叠率。逐层数据及被丢弃的前两次记录都保留在 CSV 中。毛重叠时间没有相加当作 TTFT 收益。
 
 最终完整 GSM8K 使用单独的新 journal，原先的 100 条基线和 44 条旧优化结果保持原样。两组都使用相同的 decode graph、并发 32、4-shot、greedy、最多 8192 输出；prefill 继续 eager。这样只加速精度任务的执行，不将质量测试延迟混入客户 TTFT 对照。
+
+完整 GSM8K 最终两组均为 1170/1319（88.7036%），相同的 15 个截断样本均保留计分；1319 条完整文本全部一致，独立重评分覆盖 2638 条回答。详见最终性能报告。

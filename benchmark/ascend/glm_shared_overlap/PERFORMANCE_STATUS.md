@@ -1,6 +1,6 @@
 # GLM-4.7-Flash 三阶段多流：性能与验证报告
 
-状态：实现、NPU 数值回归、44 组组件筛选和真实客户负载 profiling 已完成。推荐配置在正向与反向顺序的两轮完整客户测试中平均 TTFT 分别降低 4.12% 和 2.00%；完整 GSM8K 对照尚未结束，整个目标仍在执行。
+状态：实现、真实 NPU 回归、两轮完整客户性能测试、五次 profiling 和两组全量 GSM8K 均已完成。平均 TTFT 两轮分别降低 4.12% 和 2.00%；GSM8K 两组均为 1170/1319（88.7036%），1319 条完整生成文本全部一致。
 
 ## 实现与范围
 
@@ -75,9 +75,21 @@ overlap_pct 定义为交集时长 / min(主、副窗口时长)。1.0 表示较�
 
 真实 NPU 共享投影测试使用 GLM 的 2048→3072→1536→2048 维度，覆盖 1/128/1024/32768 token、重复复用、非默认父流、allocator churn、异常清理和 decode fallback。共享输出逐位一致，最大绝对误差为 0。组件筛选的 44 个 shape/config 组合也全部逐位一致。真实客户测试 2000 个首 token 全部一致。
 
-完整 GSM8K 对照仍待完成：本地 test 1319 题、固定 train 前 4 个示例、greedy、最多 8192 新 token，EvalScope extract_answer/math_equal 判分。最终两组使用相同的 full decode graph、并发 32，prefill graph 关闭；与旧并发 16/eager 的 100 条基线、44 条优化 journal 分开。每条输出、prompt SHA256、完成原因和截断均保留。质量运行的延迟不用于客户性能结论。
+完整 GSM8K 使用 test 全部 1319 题、固定 train 前 4 个示例、greedy、最多 8192 新 token，EvalScope extract_answer/math_equal 判分。两组使用相同的 full decode graph、并发 32，prefill graph 关闭；最终 journal 与旧并发 16/eager 的 100 条基线、44 条优化结果完全分开，没有混用或删除样本。质量运行的延迟不用于客户性能结论。
 
-解码图只捕获 BS=32，允许小 batch padding。初次捕获六个档位在关闭多流的基线首次 replay 时遇到 SQ/CQ 资源不足；失败日志保留，改为单档后成功 replay 并开始完整精度运行。最终配对双方采用相同单档配置。
+| 完整 GSM8K 指标 | 串行基线 | 推荐多流配置 |
+| --- | ---: | ---: |
+| 题数 | 1319 | 1319 |
+| 正确数 | 1170 | 1170 |
+| 准确率 | 88.7036% | 88.7036% |
+| 达到 8192-token 上限 | 15 | 15 |
+| 逐题 prompt 相同 | — | 1319/1319 |
+| 逐题预测答案相同 | — | 1319/1319 |
+| 完整生成文本相同 | — | 1319/1319 |
+
+准确率差为 **0 个百分点**。15 个截断样本在两组中也完全对应，全部保留计分。审计重新读取原始 GSM8K 参考答案，独立重算全部 2638 条回答的分数，并核对索引、prompt、完成原因、截断、输出预算及汇总计数。该数据集和配置下未观测到精度回退；这不外推为任意模型和输入的普遍数值等价。
+
+解码图只捕获 BS=32，允许小 batch padding。初次捕获六个档位在关闭多流的基线首次 replay 时遇到 SQ/CQ 资源不足；失败日志保留，改为单档后成功 replay 并完成两组全量精度运行。最终配对双方采用相同单档配置。
 
 ## 交付与复算
 
@@ -88,6 +100,11 @@ overlap_pct 定义为交集时长 / min(主、副窗口时长)。1.0 表示较�
 - `compare_gsm8k.py`：完整 1319 题、逐样本 prompt/答案/截断审计。
 - `TUNING_ROUND2.md`：候选、资源配额和选择依据。
 - `results/*-comparison.json`、`*-paired-packs.csv`、`*-mlp-analysis.json`：可复算结果。
-- 最终 profiling 包将包含 matched baseline 与门槛版的 trace、CSV、profiler metadata 及 SHA256 manifest。
+- `final-customer-profiling.zip`：matched baseline 与门槛版的 trace、CSV、profiler metadata 和逐文件 SHA256 manifest。132716394 bytes，SHA256 `661e438908186667f10049cc24cb57d3ed2186e0d3cf8453d514b9582ae38ec8`，本地 SHA256 与 ZIP CRC 校验通过。
+- `final-validation-summary.zip`：不含模型回答文本的精度汇总、1319 题一致性布尔表、性能配对表、复现代码与 Git 补丁；校验值见同目录 `final-evidence-manifest.json`。
+- 详细 GSM8K 回答、日志和启动配置保留在远端结果目录；下载包不包含这些原始内容。`compare_gsm8k.py --rescore` 可在远端重新审计。
+- `final-audit-summary.json`：确认 NPU5、44 组组件逐位一致、真实共享投影回归和原有运行时补丁完整保留。
 
-反向性能复测已完成；整个目标仅在两组完整 GSM8K 与交付审计完成后才结束。
+集成分支为 [feat/glm-npu-shared-overlap](https://github.com/hbamboo/sglang/tree/feat/glm-npu-shared-overlap)，首个集成提交 `c34ea0d0caa1363d667f8d1fe455a6370aa673bc`。核心实现最后变更为 `b8ab4bf4ae85259ad4ec85785d2b71874ce15b06`，此后只有报告、取证和复现工具变更；完整精度结果对应同一核心实现。原有 7 处未提交运行时适配与初始补丁逐字节一致，并未纳入功能分支。
+
+本任务的验证服务均已停止，原有运行时修改保持不变。集成前提和启用方式见 `INTEGRATION.md`、`README.md`。

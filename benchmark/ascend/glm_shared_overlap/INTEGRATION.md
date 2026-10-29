@@ -1,9 +1,10 @@
 # GLM-4.7-Flash shared-expert overlap: integration version
 
-This is the first integration checkpoint. The three-stage implementation,
-real NPU numerical checks, two complete customer-workload timing comparisons
-and five-capture profiling are available. The paired full GSM8K evaluation is
-still running; this checkpoint does not claim final quality acceptance.
+The first integration checkpoint was `c34ea0d0ca`. Validation is now complete:
+the three-stage implementation, real NPU numerical checks, two complete
+customer timing comparisons, five-capture profiling and paired full GSM8K
+are available. Both GSM8K runs scored 1170/1319 (88.7036%); all 1319 complete
+response texts match, with the same 15 truncated samples retained.
 
 ## Base and integration scope
 
@@ -69,7 +70,7 @@ at most 32768 new tokens per burst, and exactly one output token per request.
 The two opposite-order comparisons reduced mean TTFT by 4.122% and 2.003%,
 and P95 by 3.227% and 2.278%. All 2000 first output tokens matched in each
 comparison. These are controlled burst results, not an arrival-rate or maximum
-QPS claim. One-token parity does not replace the pending full GSM8K comparison.
+QPS claim. The separate full GSM8K result above supplies the quality evidence.
 
 Five captures per variant show all three requested overlaps in the 30861-token
 prefill (138/138 selected layer instances after discarding the first two
@@ -78,7 +79,9 @@ The full profiling package is available locally and in the remote result
 directory as `final-customer-profiling.zip`, SHA256
 `661e438908186667f10049cc24cb57d3ed2186e0d3cf8453d514b9582ae38ec8`.
 
-See `PERFORMANCE_STATUS.md` for complete measurements, limitations and current
-quality status. Final GSM8K uses 1319 questions per variant, fixed four-shot
-prompts, greedy sampling and the same 8192-token budget; all samples including
-truncations will remain in the result and be rescored independently.
+See `PERFORMANCE_STATUS.md` for complete measurements and limitations.
+Final GSM8K used 1319 questions per variant, fixed four-shot prompts, greedy
+sampling and the same 8192-token budget. All samples including truncations
+were retained, and all 2638 responses were independently rescored against the
+original references. Detailed responses stay remote; the downloadable audit
+contains numbers, equality flags and digests without model response text.

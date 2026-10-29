@@ -1,0 +1,31 @@
+{
+  "count": 1319,
+  "prompt_hashes_equal": 1319,
+  "accuracy_delta_percentage_points": 0.0,
+  "same_predicted_answer": 1319,
+  "same_full_text": 1319,
+  "baseline_correct_optimized_wrong": 0,
+  "baseline_wrong_optimized_correct": 0,
+  "rescored_records": 2638,
+  "baseline": {
+    "count": 1319,
+    "correct": 1170,
+    "accuracy": 0.8870356330553449,
+    "truncated": 15,
+    "shots": 4,
+    "temperature": 0,
+    "max_new_tokens": 8192,
+    "parallel": 32
+  },
+  "optimized": {
+    "count": 1319,
+    "correct": 1170,
+    "accuracy": 0.8870356330553449,
+    "truncated": 15,
+    "shots": 4,
+    "temperature": 0,
+    "max_new_tokens": 8192,
+    "parallel": 32
+  },
+  "detailed_records_remain_remote": true
+}
