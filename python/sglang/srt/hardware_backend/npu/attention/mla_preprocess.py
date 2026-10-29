@@ -1,3 +1,4 @@
+import os
 import re
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
@@ -561,8 +562,31 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         if self.weight_uk.dtype != torch.bfloat16:
             self.weight_uk = self.weight_uk.to(torch.bfloat16)
 
+    def _forward_mlaprolog_v3_bf16_prefill(self, positions, hidden_states, forward_batch, sin, cos):
+        from sgl_kernel_npu.mla_prolog_v3_bf16_prefill import GlmMlaPrologPrefillBf16
+
+        pool = get_token_to_kv_pool()
+        if pool.store_dtype != pool.dtype:
+            raise NotImplementedError("BF16 prefill requires an unquantized KV pool")
+        if not hasattr(self, "_v3_bf16_prefill"):
+            self._v3_bf16_prefill = GlmMlaPrologPrefillBf16(
+                self.weight_dq, self.weight_uq_qr, self.weight_uk, self.weight_dkv_kr,
+                self.q_a_layernorm.weight, self.kv_a_layernorm.weight,
+                epsilon_cq=self.q_a_layernorm.variance_epsilon,
+                epsilon_ckv=self.kv_a_layernorm.variance_epsilon)
+            if get_bool_env_var("SGLANG_NPU_MLAPO_V3_DEBUG"):
+                print("[mla_prolog_v3 BF16 prefill] layer", self.layer_id,
+                      "tokens", hidden_states.shape[0], "quant_mode=0", flush=True)
+        with torch.profiler.record_function("mla_prolog_v3_prefill_bf16"):
+            q, qr, norm, kv, kr = self._v3_bf16_prefill(hidden_states, sin, cos)
+            pool = get_token_to_kv_pool()
+            pool.set_unified_mla_kv(self.layer_id, forward_batch.out_cache_loc, kv, kr)
+        offset = self.layer_id - pool.start_layer
+        return (qr, pool.v_buffer[offset], q, pool.k_buffer[offset], norm,
+                forward_batch, positions, None)
+
     def forward_mlaprolog_v3(self, positions, hidden_states, forward_batch):
-        """MlaPrologV3 (sgl-kernel-npu) prologue: one kernel for the whole op chain."""
+        """MlaPrologV3 prologue with a separately gated large-prefill path."""
         if not self.has_preprocess_weights:
             self._mlaprolog_v3_preprocess_weight()
             self.has_preprocess_weights = True
@@ -582,6 +606,45 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         cos, sin = self.get_sin_cos(positions)
         pool = get_token_to_kv_pool()
         unified_kv = bool(getattr(pool, "flash_mla", False))
+        capture_dir = os.environ.get("SGLANG_NPU_MLAPO_V3_CAPTURE_DIR")
+        if capture_dir and self.layer_id == 2 and hidden_states.shape[0] >= 8192:
+            import json
+            from pathlib import Path
+            import torch_npu
+            seen = getattr(self, "_v3_capture_shapes", set())
+            tokens = hidden_states.shape[0]
+            if tokens not in seen and len(seen) < 3:
+                folder = Path(capture_dir)
+                folder.mkdir(parents=True, exist_ok=True)
+                inputs = dict(token_x=hidden_states, weight_dq=self.weight_dq,
+                    weight_uq_qr=self.weight_uq_qr, weight_uk=self.weight_uk,
+                    weight_dkv_kr=self.weight_dkv_kr,
+                    rmsnorm_gamma_cq=self.q_a_layernorm.weight,
+                    rmsnorm_gamma_ckv=self.kv_a_layernorm.weight,
+                    rope_sin=sin, rope_cos=cos)
+                meta = dict(layer=self.layer_id, tokens=tokens, weight_quant_mode=0,
+                    kv_cache_quant_mode=0, query_norm_flag=True,
+                    tensors={k: dict(shape=list(v.shape), stride=list(v.stride()), dtype=str(v.dtype),
+                        format=int(torch_npu.get_npu_format(v))) for k,v in inputs.items()})
+                print("[mla_prolog_v3 actual input]", json.dumps(meta), flush=True)
+                (folder / ("T%d.json" % tokens)).write_text(json.dumps(meta, indent=2))
+                torch.save({k: (torch_npu.npu_format_cast(v,2) if torch_npu.get_npu_format(v) not in (0,2) else v).cpu()
+                    for k,v in inputs.items()}, folder / ("T%d.pt" % tokens))
+                seen.add(tokens)
+                self._v3_capture_shapes = seen
+
+        if (
+            get_bool_env_var("SGLANG_NPU_MLAPO_V3_PREFILL_BF16_NATIVE")
+            and forward_batch.forward_mode.is_extend()
+            and hidden_states.shape[0] >= 1024
+            and unified_kv
+            and tuple(self.weight_uk.shape) == (20, 192, 512)
+            and self.weight_dq.shape == (2048, 768)
+            and self.weight_uq_qr.shape == (768, 5120)
+        ):
+            return self._forward_mlaprolog_v3_bf16_prefill(
+                positions, hidden_states, forward_batch, sin, cos)
+
         if unified_kv:
             kv_cache, kr_cache, cache_index = self._v3_scratch_cache(
                 hidden_states, pool
