@@ -1,0 +1,36 @@
+{
+  "baseline": {
+    "requests": 2000,
+    "packs": 248,
+    "total_input_tokens": 7566887,
+    "mean_ttft_ms": 891.3786443574936,
+    "median_ttft_ms": 909.1870645061135,
+    "p95_ttft_ms": 1008.6878590518609,
+    "total_burst_wall_ms": 230238.89262089506,
+    "requests_per_second": 8.686629688117655
+  },
+  "optimized": {
+    "requests": 2000,
+    "packs": 248,
+    "total_input_tokens": 7566887,
+    "mean_ttft_ms": 887.0488711525686,
+    "median_ttft_ms": 903.2627810374834,
+    "p95_ttft_ms": 1058.2280569942668,
+    "total_burst_wall_ms": 230230.6414929917,
+    "requests_per_second": 8.68694100416204
+  },
+  "mean_ttft_reduction_pct": 0.48573894296580766,
+  "median_ttft_reduction_pct": 0.6516022609547756,
+  "p95_ttft_reduction_pct": -4.911350671849313,
+  "burst_wall_reduction_pct": 0.003583724630285001,
+  "packs_improved": 222,
+  "paired_pack_saved_mean_ms": 0.033270677029635876,
+  "paired_pack_saved_median_ms": 23.493587505072355,
+  "paired_pack_saved_mean_bootstrap95_ms": [
+    -15.71630141106359,
+    12.072286516476813
+  ],
+  "same_output_token_count": 2000,
+  "output_token_count": 2000,
+  "outliers_excluded": 0
+}
