@@ -15,6 +15,7 @@
 """Inference-only GLM-4.7-Flash model compatible with HuggingFace weights."""
 
 import logging
+import os
 import re
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -294,6 +295,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self._npu_shared_overlap_enabled = _is_npu and get_bool_env_var(
             "SGLANG_NPU_SHARED_EXPERT_OVERLAP"
         )
+        self._npu_shared_overlap_min_tokens = int(
+            os.environ.get("SGLANG_NPU_SHARED_EXPERT_OVERLAP_MIN_TOKENS", "0")
+        )
         self._npu_shared_overlap = None
 
         self._enable_a2a_moe = (
@@ -344,11 +348,19 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         )
 
         if self._npu_shared_overlap is None:
-            self._npu_shared_overlap = SharedExpertOverlap(self.experts, self.shared_experts)
+            self._npu_shared_overlap = SharedExpertOverlap(
+                self.experts,
+                self.shared_experts,
+                prequant=get_bool_env_var("SGLANG_NPU_SHARED_EXPERT_OVERLAP_PREQUANT"),
+                cube_cores=int(os.environ.get("SGLANG_NPU_SHARED_EXPERT_OVERLAP_CUBE_CORES", "-1")),
+                vector_cores=int(os.environ.get("SGLANG_NPU_SHARED_EXPERT_OVERLAP_VECTOR_CORES", "-1")),
+            )
         overlap = self._npu_shared_overlap
         # Avoid competing with the router GEMM; gate/up starts with top-k.
-        router_logits = self.gate(hidden_states)
         with shared_expert_overlap_context(overlap):
+            if overlap.prequant:
+                overlap.prepare(hidden_states)
+            router_logits = self.gate(hidden_states)
             overlap.start(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)

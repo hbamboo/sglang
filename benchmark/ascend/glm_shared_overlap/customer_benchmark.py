@@ -17,6 +17,7 @@ parser.add_argument('--output',required=True)
 parser.add_argument('--cache',default='/mnt/paas/hxdnpu/glm-shared-overlap-20261030/customer-inputs.json.gz')
 parser.add_argument('--profile-dir')
 parser.add_argument('--profile-pack',type=int,default=0)
+parser.add_argument('--profile-repeat',type=int,default=1)
 args=parser.parse_args()
 dataset=pathlib.Path(args.dataset)
 identity=hashlib.sha256(dataset.read_bytes()).hexdigest()
@@ -71,7 +72,7 @@ def run_pack(pack):
 for pack in packs[:3]:run_pack(pack)
 if args.profile_dir:
     session.post(args.base+'/start_profile',json=dict(output_dir=args.profile_dir,activities=['CPU','GPU'],with_stack=False,record_shapes=True),timeout=120).raise_for_status()
-    try:results=[run_pack(packs[args.profile_pack])]
+    try:results=[run_pack(packs[args.profile_pack]) for _ in range(args.profile_repeat)]
     finally:session.post(args.base+'/stop_profile',timeout=1200).raise_for_status()
 else:
     results=[]

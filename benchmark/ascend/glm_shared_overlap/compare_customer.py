@@ -8,10 +8,11 @@ import statistics
 
 parser=argparse.ArgumentParser()
 parser.add_argument('--optimized',default='optimized-fresh-customer')
+parser.add_argument('--baseline',default='baseline-customer')
 parser.add_argument('--results-dir',type=pathlib.Path)
 args=parser.parse_args()
 root=args.results_dir or pathlib.Path(__file__).parent/'results'
-base=json.loads((root/'baseline-customer.json').read_text(encoding='utf-8'))
+base=json.loads((root/(args.baseline+'.json')).read_text(encoding='utf-8'))
 opt=json.loads((root/(args.optimized+'.json')).read_text(encoding='utf-8'))
 assert base['dataset_sha256']==opt['dataset_sha256']
 assert base['summary']['requests']==opt['summary']['requests']==2000

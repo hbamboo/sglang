@@ -19,9 +19,16 @@ _active_overlap = ContextVar("npu_shared_expert_overlap", default=None)
 
 
 @lru_cache(maxsize=None)
-def _shared_stream(device_index):
+def _shared_stream(device_index, cube_cores=-1, vector_cores=-1):
     # Calls run on the current NPU, keyed to prevent sharing across devices.
-    return torch.npu.Stream(device=device_index)
+    stream = torch.npu.Stream(device=device_index)
+    if cube_cores != -1 or vector_cores != -1:
+        limits = torch.npu.get_stream_limit(stream)
+        for requested, key in [(cube_cores, "cube_core_num"), (vector_cores, "vector_core_num")]:
+            if requested != -1 and not 1 <= requested <= limits[key]:
+                raise ValueError(f"Shared stream {key}={requested} exceeds hardware limit {limits[key]}")
+        torch.npu.set_stream_limit(stream, cube_num=cube_cores, vector_num=vector_cores)
+    return stream
 
 
 def _linear_kernel(layer):
@@ -41,9 +48,11 @@ def can_overlap_shared_expert(block, hidden_states, forward_batch):
     return (
         forward_batch is not None
         and forward_batch.forward_mode.is_extend_without_speculative()
-        and hidden_states.shape[0] > 0
+        and hidden_states.shape[0] >= max(1, getattr(block, "_npu_shared_overlap_min_tokens", 0))
         and hidden_states.dtype == torch.bfloat16
         and block.tp_size == 1
+        and getattr(experts, "moe_ep_size", 1) == 1
+        and getattr(experts, "moe_tp_size", 1) == 1
         and not block._enable_a2a_moe
         and not getattr(experts, "_use_ascend_fuseep", False)
         and block.num_fused_shared_experts == 0
@@ -70,16 +79,20 @@ def shared_expert_overlap_context(overlap):
     finally:
         # Also protect error paths: input references can be released by the
         # caller only after pending shared work has been joined to its stream.
-        overlap.close()
-        _active_overlap.reset(token)
+        try:
+            overlap.close()
+        finally:
+            _active_overlap.reset(token)
 
 
 class SharedExpertOverlap:
-    def __init__(self, experts, shared):
+    def __init__(self, experts, shared, *, prequant=False, cube_cores=-1, vector_cores=-1):
         self.experts = experts
         self.shared = shared
-        self.stream = _shared_stream(torch.npu.current_device())
+        self.prequant = prequant
+        self.stream = _shared_stream(torch.npu.current_device(), cube_cores, vector_cores)
         self.input_ready = torch.npu.Event()
+        self.router_done = torch.npu.Event()
         self.gmm1_done = torch.npu.Event()
         self.gmm2_done = torch.npu.Event()
         self.shared_done = torch.npu.Event()
@@ -94,7 +107,34 @@ class SharedExpertOverlap:
     def _label(self, name):
         return torch.profiler.record_function(name) if self.annotate else nullcontext()
 
+    def prepare(self, hidden_states):
+        """Quantize shared input while the main stream computes router logits."""
+        if not self.prequant or self.main is not None:
+            raise RuntimeError("Shared input prepare requires an idle prequant pipeline")
+        self.main = torch.npu.current_stream()
+        self.output_dtype = hidden_states.dtype
+        self.input_ready.record(self.main)
+        self.stream.wait_event(self.input_ready)
+        hidden_states.record_stream(self.stream)
+        with torch.npu.stream(self.stream), self._label("shared_overlap/input_quant"):
+            self.quantized, self.scales = torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states, dst_type=torch.float8_e4m3fn
+            )
+        self.stage = -1
+
     def start(self, hidden_states):
+        if self.prequant:
+            if self.stage != -1 or self.main != torch.npu.current_stream():
+                raise RuntimeError("Shared gate/up must follow prepare on the same caller stream")
+            self.router_done.record(self.main)
+            self.stream.wait_event(self.router_done)
+            with torch.npu.stream(self.stream), self._label("shared_overlap/gate_up"):
+                self.gate_up = _linear_kernel(self.shared.gate_up_proj).apply_quantized(
+                    self.shared.gate_up_proj, self.quantized, self.scales, self.output_dtype
+                )
+            self.quantized = self.scales = None
+            self.stage = 1
+            return
         if self.main is not None:
             raise RuntimeError("Shared expert overlap cannot be reentered")
         self.main = torch.npu.current_stream()
