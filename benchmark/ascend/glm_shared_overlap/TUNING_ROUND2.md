@@ -20,10 +20,10 @@ flowchart LR
     F --> J
     G1 -. event: postpone shared activation .-> A
     G2 -. event: postpone shared down .-> D
-    R -. event: start shared gate/up with TopK .-> U
+    R -. P0 event: start shared quant and gate/up .-> Q
 ```
 
-数据边为实线；虚线是为资源互补而增加的 event 约束。attention/KV、下一层与本层输出之间保留原数据依赖。
+图中展示 P0。数据边为实线；虚线是为资源互补而增加的 event 约束。P1 把 Router→input quant 的 event 改为 Router→gate/up，使 input quant 可提前执行。attention/KV、下一层与本层输出之间保留原数据依赖。
 
 - P0（既有三阶段）：Router 后共享流执行 input quant + gate/up；其后两个共享阶段分别等 GMM1、GMM2。
 - P1（提前量化）：input quant 与 Router 并行，gate/up GEMM 仍等 Router 后与 TopK/init 并行；激活和 down 仍严格保持用户指定的后两阶段。

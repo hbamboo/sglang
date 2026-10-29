@@ -53,4 +53,25 @@ The primary workload is the user's `/mnt/sfs_turbo/hxd/CHAT-mxfp8-customer-2000.
 
 `run_customer_validation.py` orchestrates the primary customer-workload performance and profiling comparisons, then the full GSM8K baseline and optimized runs. `run_validation.py` contains server/job helpers and the original microbenchmark workflow. They use localhost port 19255 on physical NPU 5 and only terminate server process groups they created after verifying the command line. Progress is recorded atomically in `validation-state.json`; inspect the live process before restarting anything. GSM8K `--resume` preserves completed records in the same variant's JSONL journal.
 
+Final quality services use `--cuda-graph-backend-prefill disabled
+--cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32
+--cuda-graph-bs-decode 32` with padding enabled. Capturing six batch-size graphs
+exhausted SQ/CQ resources on first replay in the baseline; the single graph
+configuration successfully replays. Keep identical graph settings in both arms.
+Run `compare_gsm8k.py --results-dir <results> --rescore` after both full runs:
+it checks all 1319 questions, references, prompt hashes, completion reasons,
+truncation and summary counts, then recomputes 2638 EvalScope scores.
+`record_provenance.py` records package/data/config hashes and verifies that the
+pre-existing runtime patch remains byte-identical. `build_delivery.py` bundles
+the completed audits, raw results, launch configurations, sources and Git patch;
+the large profiling ZIP stays separate and is referenced by checksum.
+
+After the task releases its service, `bash reproduce_server.sh baseline perf`
+or `bash reproduce_server.sh optimized perf` starts the exact controlled
+performance configuration. Run `customer_benchmark.py --output <new-result.json>`
+against each service in turn. For GSM8K, use the `quality` purpose and
+`gsm8k_eval.py --parallel 32 --output <new-result.json>`. Use separate output
+directories and preserve both full journals. These commands only use NPU 5
+and do not stop other processes.
+
 Results and full profiling are written to `/mnt/paas/hxdnpu/glm-shared-overlap-20261030`. Performance and quality conclusions require the completed result files, not only a passing unit test or an enabled environment flag.

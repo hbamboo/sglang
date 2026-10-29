@@ -13,9 +13,9 @@
 推荐环境变量：
 
 ```bash
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-SGLANG_NPU_SHARED_EXPERT_OVERLAP=1
-SGLANG_NPU_SHARED_EXPERT_OVERLAP_MIN_TOKENS=8192
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_NPU_SHARED_EXPERT_OVERLAP=1
+export SGLANG_NPU_SHARED_EXPERT_OVERLAP_MIN_TOKENS=8192
 ```
 
 基线使用相同 allocator，关闭 overlap。提前量化开关为 0，副流 cube/vector 上限为 -1。门槛针对实际调度出的每次 prefill；小尾批次回退串行。门槛的代码默认值仍为 0，推荐部署显式设置 8192。
@@ -67,6 +67,8 @@ SGLANG_NPU_SHARED_EXPERT_OVERLAP_MIN_TOKENS=8192
 
 大批次 138/138 层实例的三个阶段 overlap_pct 都达到 0.5，三个阶段中位数均为 1.0。小尾批次没有足够的工作掩盖跨流提交开销，门槛版直接回退。MLP 窗口按 post-attention AddRmsNorm 结束至最终 shared+routed Add 结束计算；原始 5 次及 selected 标记都保存在逐层 CSV。
 
+overlap_pct 定义为交集时长 / min(主、副窗口时长)。1.0 表示较短窗口被覆盖，并不表示共享阶段必然全部被掩盖或完全没有拖尾。
+
 并发仍拉长主流：大批次 init routing / GMM2 / finalize 平均从 1377/956/343 us 增至 1447/1057/404 us。收益来自整个 MLP 窗口变短，不能把三个阶段毛重叠相加当成 TTFT 节省。提前量化和 stream 限核的 44 组组件实验全部数值一致，但没有稳定胜过原调度，保留为默认关闭的实验选项。
 
 ## 精度验证
@@ -74,6 +76,8 @@ SGLANG_NPU_SHARED_EXPERT_OVERLAP_MIN_TOKENS=8192
 真实 NPU 共享投影测试使用 GLM 的 2048→3072→1536→2048 维度，覆盖 1/128/1024/32768 token、重复复用、非默认父流、allocator churn、异常清理和 decode fallback。共享输出逐位一致，最大绝对误差为 0。组件筛选的 44 个 shape/config 组合也全部逐位一致。真实客户测试 2000 个首 token 全部一致。
 
 完整 GSM8K 对照仍待完成：本地 test 1319 题、固定 train 前 4 个示例、greedy、最多 8192 新 token，EvalScope extract_answer/math_equal 判分。最终两组使用相同的 full decode graph、并发 32，prefill graph 关闭；与旧并发 16/eager 的 100 条基线、44 条优化 journal 分开。每条输出、prompt SHA256、完成原因和截断均保留。质量运行的延迟不用于客户性能结论。
+
+解码图只捕获 BS=32，允许小 batch padding。初次捕获六个档位在关闭多流的基线首次 replay 时遇到 SQ/CQ 资源不足；失败日志保留，改为单档后成功 replay 并开始完整精度运行。最终配对双方采用相同单档配置。
 
 ## 交付与复算
 
