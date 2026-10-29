@@ -55,3 +55,8 @@ prefills retain the original serial path. The provided wrapper keeps allocator,
 FIA, latent transport and D behavior consistent with the preceding comparison.
 The final serving report records exact capacity, revisions, per-run metrics and
 whether actual QPS >= 9.5 and mean E2E <= 1500 ms were verified.
+
+The wrapper copies the site launcher and explicitly adds
+`--disable-shared-experts-fusion` on both PD roles. The site original is untouched.
+The generated command script was byte-identical to the launcher used for the
+reported timed acceptance. Final timed application revision: `7027a44515`.
