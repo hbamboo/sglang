@@ -755,6 +755,9 @@ class Envs:
     # P-only expanded K/V cache consumed directly by paged FIA. The latent
     # cache remains allocated and is the only cache registered for PD transfer.
     SGLANG_NPU_PREFILL_EXPANDED_KV = EnvBool(False)
+    # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
+    # Set only on P. Zero preserves the existing capacity calculation.
+    SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB = EnvInt(0)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)

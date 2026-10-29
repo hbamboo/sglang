@@ -92,6 +92,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _npu_prefill_transient_reserve_bytes(kvc: KVCacheConfigurator) -> int:
+    """Keep measured transient demand outside the static KV allocation budget."""
+    reserve_mib = envs.SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB.get()
+    if reserve_mib < 0:
+        raise ValueError("SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB must be nonnegative")
+    if reserve_mib == 0:
+        return 0
+    if (
+        not str(kvc.device).startswith("npu")
+        or get_disagg().disaggregation_mode != "prefill"
+    ):
+        raise ValueError("SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB requires NPU PD prefill")
+    logger.info(
+        "NPU prefill transient reserve: %d MiB excluded from the KV budget", reserve_mib
+    )
+    return reserve_mib * 1024 * 1024
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
@@ -169,6 +187,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         self._expanded_prefill_kv = envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get()
+        self._transient_prefill_reserve_bytes = _npu_prefill_transient_reserve_bytes(
+            kvc
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -455,9 +476,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        reserve_bytes = getattr(self, "_transient_prefill_reserve_bytes", 0)
+        available_bytes -= reserve_bytes
         if getattr(self, "_expanded_prefill_kv", False):
             # NPU pools allocate one extra physical page for the dummy slot.
             available_bytes -= self._cell_size * page_size
+        if reserve_bytes and available_bytes < self._cell_size * page_size:
+            raise RuntimeError("NPU prefill transient reservation leaves less than one KV page")
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

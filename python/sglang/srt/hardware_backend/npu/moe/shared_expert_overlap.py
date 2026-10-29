@@ -7,7 +7,6 @@ The second and third stages wait for GMM1 and GMM2 respectively, avoiding
 concurrent expert GEMMs while using the complementary vector/cube work.
 """
 
-import os
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import lru_cache
@@ -88,22 +87,10 @@ def shared_expert_overlap_context(overlap):
 
 class SharedExpertOverlap:
     def __init__(self, experts, shared, *, prequant=False, cube_cores=-1, vector_cores=-1):
-        self.schedule = os.environ.get("SGLANG_NPU_SHARED_EXPERT_OVERLAP_SCHEDULE", "staged")
-        if self.schedule not in {"staged", "gate_only"}:
-            raise ValueError(f"Unknown shared expert schedule: {self.schedule}")
-        if self.schedule == "gate_only" and prequant:
-            raise ValueError("gate_only requires prequant disabled")
         self.experts = experts
         self.shared = shared
         self.prequant = prequant
-        self.force_main = get_bool_env_var("SGLANG_NPU_SHARED_EXPERT_OVERLAP_FORCE_MAIN")
-        self._reported_main = None
-        # Diagnostic only: preserve stages while removing the side stream.
-        self.stream = (
-            torch.npu.current_stream()
-            if self.force_main
-            else _shared_stream(torch.npu.current_device(), cube_cores, vector_cores)
-        )
+        self.stream = _shared_stream(torch.npu.current_device(), cube_cores, vector_cores)
         self.input_ready = torch.npu.Event()
         self.router_done = torch.npu.Event()
         self.gmm1_done = torch.npu.Event()
@@ -121,12 +108,6 @@ class SharedExpertOverlap:
         return torch.profiler.record_function(name) if self.annotate else nullcontext()
 
     def prepare(self, hidden_states):
-        if self.force_main:
-            self.stream = torch.npu.current_stream()
-            assert self.stream == torch.npu.current_stream()
-            if self._reported_main != self.stream:
-                print("NPU_FORCE_MAIN_DIAG", "main=" + str(torch.npu.current_stream()), "side=" + str(self.stream), "equal=True", flush=True)
-                self._reported_main = self.stream
         """Quantize shared input while the main stream computes router logits."""
         if not self.prequant or self.main is not None:
             raise RuntimeError("Shared input prepare requires an idle prequant pipeline")
@@ -142,12 +123,6 @@ class SharedExpertOverlap:
         self.stage = -1
 
     def start(self, hidden_states):
-        if self.force_main:
-            self.stream = torch.npu.current_stream()
-            assert self.stream == torch.npu.current_stream()
-            if self._reported_main != self.stream:
-                print("NPU_FORCE_MAIN_DIAG", "main=" + str(torch.npu.current_stream()), "side=" + str(self.stream), "equal=True", flush=True)
-                self._reported_main = self.stream
         if self.prequant:
             if self.stage != -1 or self.main != torch.npu.current_stream():
                 raise RuntimeError("Shared gate/up must follow prepare on the same caller stream")
@@ -169,13 +144,9 @@ class SharedExpertOverlap:
         hidden_states.record_stream(self.stream)
         with torch.npu.stream(self.stream), self._label("shared_overlap/gate_up"):
             self.gate_up = self.shared.gate_up_proj(hidden_states)[0]
-            if self.schedule == "gate_only":
-                self.shared_done.record(self.stream)
         self.stage = 1
 
     def before_gmm2(self):
-        if self.schedule == "gate_only":
-            return
         if self.stage != 1:
             raise RuntimeError("Shared activation must follow gate/up")
         self.gmm1_done.record(self.main)
@@ -189,8 +160,6 @@ class SharedExpertOverlap:
         self.stage = 2
 
     def after_gmm2(self):
-        if self.schedule == "gate_only":
-            return
         if self.stage != 2:
             raise RuntimeError("Shared down projection must follow activation")
         self.gmm2_done.record(self.main)
@@ -204,16 +173,6 @@ class SharedExpertOverlap:
         self.stage = 3
 
     def finish(self):
-        if self.schedule == "gate_only":
-            if self.stage != 1:
-                raise RuntimeError("gate_only finish requires gate/up")
-            self.main.wait_event(self.shared_done)
-            self.gate_up.record_stream(self.main)
-            with self._label("shared_overlap/serial_tail"):
-                output = self.shared.down_proj(self.shared.act_fn(self.gate_up))[0]
-            self.gate_up = None
-            self.stage = 4
-            return output
         if self.stage != 3:
             raise RuntimeError("The Ascend runner did not execute shared overlap stages")
         self.main.wait_event(self.shared_done)
