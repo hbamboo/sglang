@@ -96,7 +96,12 @@ class SharedExpertOverlap:
         self.experts = experts
         self.shared = shared
         self.prequant = prequant
-        self.stream = _shared_stream(torch.npu.current_device(), cube_cores, vector_cores)
+        # Diagnostic only: preserve stages while removing the side stream.
+        self.stream = (
+            torch.npu.current_stream()
+            if get_bool_env_var("SGLANG_NPU_SHARED_EXPERT_OVERLAP_FORCE_MAIN")
+            else _shared_stream(torch.npu.current_device(), cube_cores, vector_cores)
+        )
         self.input_ready = torch.npu.Event()
         self.router_done = torch.npu.Event()
         self.gmm1_done = torch.npu.Event()

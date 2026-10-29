@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -625,10 +628,29 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
+            memory_diag = (
+                os.environ.get("SGLANG_NPU_MEMORY_DIAGNOSTIC") == "1"
+                and forward_batch.forward_mode.is_extend()
+            )
+            if memory_diag:
+                torch.npu.reset_peak_memory_stats()
+                memory_before = torch.npu.memory_stats()
+                memory_started = time.perf_counter()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if memory_diag:
+                memory_after = torch.npu.memory_stats()
+                fields = ["allocated_bytes.all.current", "allocated_bytes.all.peak",
+                          "reserved_bytes.all.current", "reserved_bytes.all.peak",
+                          "active_bytes.all.current", "active_bytes.all.peak",
+                          "num_alloc_retries", "num_ooms"]
+                logger.info("NPU_MEMORY_DIAG %s", json.dumps(dict(
+                    tokens=int(forward_batch.input_ids.numel()),
+                    host_forward_ms=1000 * (time.perf_counter() - memory_started),
+                    before={key: memory_before.get(key) for key in fields},
+                    after={key: memory_after.get(key) for key in fields})))
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
