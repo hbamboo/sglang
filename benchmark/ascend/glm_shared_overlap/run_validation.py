@@ -80,23 +80,27 @@ def start_server(name, enabled, template):
         time.sleep(1)
     raise RuntimeError(f'{name} server readiness timeout')
 
-try:
-    baseline=json.loads((OUT/'baseline-server.json').read_text())
-    profile('baseline-profile')
-    status('baseline-stop')
-    stop_server(baseline)
-    optimized=start_server('optimized',True,baseline)
-    benchmark('optimized-ttft')
-    profile('optimized-profile')
-    child('optimized-gsm8k',['python3',str(OUT/'gsm8k_eval.py'),'--output',str(OUT/'optimized-gsm8k.json')])
-    status('optimized-stop')
-    stop_server(optimized)
-    baseline2=start_server('baseline-repeat',False,baseline)
-    benchmark('baseline-repeat-ttft')
-    child('baseline-gsm8k',['python3',str(OUT/'gsm8k_eval.py'),'--output',str(OUT/'baseline-gsm8k.json')])
-    status('baseline-repeat-stop')
-    stop_server(baseline2)
-    status('complete', finished=True)
-except BaseException:
-    status('failed', error=traceback.format_exc(), finished=True)
-    raise
+def main():
+    try:
+        baseline=json.loads((OUT/'baseline-server.json').read_text())
+        profile('baseline-profile')
+        status('baseline-stop')
+        stop_server(baseline)
+        optimized=start_server('optimized',True,baseline)
+        benchmark('optimized-ttft')
+        profile('optimized-profile')
+        child('optimized-gsm8k',['python3',str(OUT/'gsm8k_eval.py'),'--output',str(OUT/'optimized-gsm8k.json')])
+        status('optimized-stop')
+        stop_server(optimized)
+        baseline2=start_server('baseline-repeat',False,baseline)
+        benchmark('baseline-repeat-ttft')
+        child('baseline-gsm8k',['python3',str(OUT/'gsm8k_eval.py'),'--output',str(OUT/'baseline-gsm8k.json')])
+        status('baseline-repeat-stop')
+        stop_server(baseline2)
+        status('complete', finished=True)
+    except BaseException:
+        status('failed', error=traceback.format_exc(), finished=True)
+        raise
+
+if __name__ == "__main__":
+    main()

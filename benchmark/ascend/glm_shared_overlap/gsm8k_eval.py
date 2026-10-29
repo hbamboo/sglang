@@ -17,6 +17,7 @@ parser.add_argument('--output', required=True)
 parser.add_argument('--limit', type=int, default=1319)
 parser.add_argument('--parallel', type=int, default=16)
 parser.add_argument('--max-new-tokens', type=int, default=8192)
+parser.add_argument('--resume', action='store_true')
 args = parser.parse_args()
 root = pathlib.Path('/mnt/paas/hmxnpu/gsm8k/main')
 test = pd.read_parquet(root / 'test-00000-of-00001.parquet').head(args.limit)
@@ -30,7 +31,7 @@ examples = '\n\n'.join(few_shot)
 started = time.monotonic()
 path = pathlib.Path(args.output)
 journal = path.with_suffix('.jsonl')
-assert not journal.exists(), f'Refusing to overwrite existing evaluation {journal}'
+assert args.resume or not journal.exists(), f'Refusing to overwrite existing evaluation {journal}'
 
 def evaluate(pair):
     index, item = pair
@@ -46,9 +47,13 @@ def evaluate(pair):
     finish = result['meta_info'].get('finish_reason', {})
     return dict(index=int(index), question=item['question'], target=target, predicted=predicted, correct=correct, prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(), text=text, meta_info=result['meta_info'], truncated=finish.get('type')=='length' if isinstance(finish,dict) else False)
 
-records = []
-with journal.open('w') as output, concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
-    futures = [pool.submit(evaluate, item) for item in test.iterrows()]
+records = [json.loads(line) for line in journal.open() if line.strip()] if args.resume and journal.exists() else []
+done = {record['index'] for record in records}
+assert len(done)==len(records)
+for record in records:
+    assert record['question']==test.loc[record['index'],'question']
+with journal.open('a' if args.resume else 'w') as output, concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
+    futures = [pool.submit(evaluate, item) for item in test.iterrows() if item[0] not in done]
     for future in concurrent.futures.as_completed(futures):
         record = future.result()
         records.append(record)
