@@ -45,7 +45,7 @@ try:
     quality['cmd'] += ['--cuda-graph-backend-prefill', 'disabled',
                        '--cuda-graph-backend-decode', 'full',
                        '--cuda-graph-max-bs-decode', '32',
-                       '--cuda-graph-bs-decode', '1', '2', '4', '8', '16', '32']
+                       '--cuda-graph-bs-decode', '32']
     (OUT / 'final-quality-template.json').write_text(json.dumps(quality, indent=2))
     for name, enabled in [('baseline-final', False), ('optimized-final', True)]:
         server = control.start_server(name + '-quality', enabled, quality)
