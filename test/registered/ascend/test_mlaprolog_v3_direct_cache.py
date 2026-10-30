@@ -67,7 +67,7 @@ def test_wrapper_skips_scratch_and_landing_keeps_pd_abi(monkeypatch,tokens):
         weight_uk=args['weight_uk'],weight_dkv_kr=args['weight_dkv_kr'],
         q_a_layernorm=SimpleNamespace(weight=args['rmsnorm_gamma_cq'],variance_epsilon=1e-5),
         kv_a_layernorm=SimpleNamespace(weight=args['rmsnorm_gamma_ckv'],variance_epsilon=1e-5),
-        get_sin_cos=lambda positions:(args['rope_cos'],args['rope_sin']))
+        get_sin_cos=lambda positions,forward_batch=None:(args['rope_cos'],args['rope_sin']))
     obj._v3_scratch_cache=types.MethodType(prolog.NPUFusedMLAPreprocess._v3_scratch_cache,obj)
     monkeypatch.setattr(prolog,'get_token_to_kv_pool',lambda:pool)
     monkeypatch.setattr(prolog,'get_attn_backend',lambda:SimpleNamespace(use_flash_mla=True))
