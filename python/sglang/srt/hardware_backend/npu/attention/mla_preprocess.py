@@ -67,6 +67,23 @@ def is_mlaprolog_v3_enabled() -> bool:
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO_V3")
 
 
+@lru_cache(maxsize=1)
+def is_mlaprolog_v3_direct_cache_enabled() -> bool:
+    """Decode-only direct writes to FlashMLA's interleaved latent cache."""
+    return get_bool_env_var("SGLANG_NPU_MLAPO_V3_DIRECT_CACHE")
+
+
+@lru_cache(maxsize=1)
+def _require_mlaprolog_v3_direct_cache() -> None:
+    from sgl_kernel_npu.mla_prolog_v3_compat import direct
+
+    if getattr(direct(), "mla_prolog_v3_direct_cache_version", 0) < 1:
+        raise RuntimeError(
+            "SGLANG_NPU_MLAPO_V3_DIRECT_CACHE requires sgl-kernel-npu "
+            "with mla_prolog_v3_direct_cache_version >= 1"
+        )
+
+
 def round_up(val: int, align: int) -> int:
     if align == 0:
         return 0
@@ -603,7 +620,23 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         cos, sin = self.get_sin_cos(positions, forward_batch)
         pool = get_token_to_kv_pool()
         unified_kv = bool(getattr(pool, "flash_mla", False))
-        if unified_kv:
+        direct_cache = is_mlaprolog_v3_direct_cache_enabled()
+        if direct_cache:
+            if not unified_kv or not get_attn_backend().use_flash_mla:
+                raise RuntimeError(
+                    "MLA direct cache requires the unified FlashMLA decode path"
+                )
+            if pool.store_dtype != torch.bfloat16 or pool.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "MLA direct cache currently requires unquantized BF16 KV"
+                )
+            _require_mlaprolog_v3_direct_cache()
+            # Wait for any outstanding PD layer transfer before touching its page.
+            cache = pool.get_flash_mla_kv_buffer(self.layer_id)
+            kv_cache = cache[..., : self.kv_lora_rank]
+            kr_cache = cache[..., self.kv_lora_rank :]
+            cache_index = forward_batch.out_cache_loc.to(dtype=torch.int64)
+        elif unified_kv:
             kv_cache, kr_cache, cache_index = self._v3_scratch_cache(
                 hidden_states, pool
             )
@@ -636,10 +669,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             weight_quant_mode=0,  # weights are bf16 (dequantised above)
         )
 
-        if unified_kv:
-            # The kernel can only address a packed (blocks, page, 1, W) cache, so
-            # it wrote the one-step scratch above; land those rows in the fused
-            # pool the same way set_kv_buffer() does.  The attention backend
+        if unified_kv and not direct_cache:
+            # Compatibility path for kernels without physical cache-stride support:
+            # the packed one-step scratch is landed in the final cache below.
+            # Land the packed one-step scratch rows in the fused pool the
+            # same way set_kv_buffer() does. The attention backend
             # reads the pool directly, MLAPO reports save_kv_cache=False.
             num_tokens = hidden_states.shape[0]
             pool.set_unified_mla_kv(
