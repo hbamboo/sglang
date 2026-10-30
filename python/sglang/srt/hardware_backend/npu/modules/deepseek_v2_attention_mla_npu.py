@@ -8,7 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
-    is_mla_preprocess_enabled,
+    is_mla_preprocess_for_batch,
 )
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
@@ -159,7 +159,7 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
 ):
-    if is_mla_preprocess_enabled():
+    if is_mla_preprocess_for_batch(forward_batch):
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
@@ -372,7 +372,7 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
+    if is_mla_preprocess_for_batch(forward_batch) and forward_batch.forward_mode.is_decode():
         (
             q_pe,
             k_pe,

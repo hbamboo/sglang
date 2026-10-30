@@ -30,7 +30,7 @@ def test_geometry_and_capacity():
 def make_pool(monkeypatch, device, layers=2, pages=40):
     import sglang.srt.hardware_backend.npu.memory_pool_npu as pools
 
-    monkeypatch.setattr(pools, "is_flash_mla_enabled", lambda: True)
+    monkeypatch.setattr(pools, "use_unified_mla_kv_layout", lambda: True)
     return pools.NPUMLATokenToKVPool(
         size=(pages - 1) * 128,
         page_size=128,

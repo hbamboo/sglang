@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
+    is_mla_preprocess_for_batch,
     is_mlaprolog_v3_enabled,
 )
 from sglang.srt.hardware_backend.npu.attention import (
@@ -1652,7 +1653,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if is_mla_preprocess_for_batch(forward_batch) and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
         if self.is_dllm_model:
@@ -3150,7 +3151,7 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if is_mla_preprocess_for_batch(forward_batch) and self.use_mla:
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:

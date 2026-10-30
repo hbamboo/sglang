@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 @lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
-    # Legacy MLAPO writes two separate buffers; V3 compatibility is applied next.
+    # Legacy MLAPO writes packed split buffers; V3 uses scratch plus scatter.
     if (
         envs.ENABLE_ASCEND_FLASH_MLA.get()
         or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
@@ -31,6 +31,17 @@ def is_mla_preprocess_enabled() -> bool:
     # The ported MlaPrologV3 path lives inside the MLAPO prologue, so enabling
     # it implies the fused prologue (and the save_kv_cache=False handshake).
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO") or is_mlaprolog_v3_enabled()
+
+
+def is_mla_preprocess_for_batch(forward_batch) -> bool:
+    """V3 is decode-only; prefill retains its existing expanded-KV route.
+
+    Use the same predicate in prepare and attention's cache-write handshake:
+    a prefill that skips the prologue must still save its new latent KV.
+    """
+    return is_mla_preprocess_enabled() and (
+        not is_mlaprolog_v3_enabled() or forward_batch.forward_mode.is_decode()
+    )
 
 
 @lru_cache(maxsize=1)
@@ -47,7 +58,7 @@ def is_fia_nz() -> bool:
 def is_mlaprolog_v3_enabled() -> bool:
     """Use the ported MlaPrologV3 kernel for the MLA prologue (A/B switch).
 
-    ``SGLANG_NPU_USE_MLAPO_V3=1`` (in addition to ``SGLANG_NPU_USE_MLAPO=1``)
+    ``SGLANG_NPU_USE_MLAPO_V3=1`` (which implies the MLAPO prologue)
     replaces the fused int8 ``npu_mla_preprocess`` / the unfused prologue with
     the MlaPrologV3 operator from sgl-kernel-npu.  It accepts the GLM-4.7-Flash
     geometry (He=2048, Hcq=768, Hckv=512, D=192, Dr=64, N=20) and either MXFP8
