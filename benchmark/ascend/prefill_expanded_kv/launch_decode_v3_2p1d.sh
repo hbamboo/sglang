@@ -12,6 +12,7 @@ exec bash "${SCRIPT_DIR}/launch_reserved_1p1d.sh" \
   --decode-distributed-port-base 29700 \
   --prefill-env ENABLE_ASCEND_FLASH_MLA=0 \
   --prefill-env SGLANG_NPU_MLA_UNIFIED_KV=1 \
+  --prefill-env SGLANG_NPU_DISABLE_YARN_KV_SINK=0 \
   --prefill-env SGLANG_NPU_USE_MLAPO=0 \
   --prefill-env SGLANG_NPU_USE_MLAPO_V3=0 \
   --prefill-env SGLANG_USE_FIA_NZ=0 \
