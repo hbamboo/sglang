@@ -291,11 +291,22 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
         self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
 
-    def get_sin_cos(self, positions):
+    def get_sin_cos(self, positions, forward_batch=None):
+        # The model resets this cache at every Python forward, including each
+        # warmup/capture invocation. A captured graph therefore still records
+        # one gather/repeat chain that refreshes the shared outputs on replay.
+        cache = getattr(forward_batch, "npu_mlaprolog_rope_cache", None)
+        if cache is not None:
+            # Tensor keys retain positions and distinguish TBO child views.
+            key = (id(self.rotary_emb), positions)
+            if key in cache:
+                return cache[key]
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         cos = cos.repeat(1, 2)
         sin = sin.repeat(1, 2)
+        if cache is not None:
+            cache[key] = (cos, sin)
         return cos, sin
 
     def get_kv_cache_and_cache_idx(self, forward_batch):
@@ -589,7 +600,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                     flush=True,
                 )
 
-        cos, sin = self.get_sin_cos(positions)
+        cos, sin = self.get_sin_cos(positions, forward_batch)
         pool = get_token_to_kv_pool()
         unified_kv = bool(getattr(pool, "flash_mla", False))
         if unified_kv:
@@ -689,7 +700,17 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             dtype=dtype,
             device=device,
         )
-        cache_index = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        # Graph warmup prepares these immutable indices before capture. Keep
+        # every capacity alive: earlier graphs may still reference its storage.
+        # Power-of-two capacities bound storage even for varying prefill sizes.
+        indices = getattr(self, "_v3_cache_indices", None)
+        if indices is None:
+            indices = self._v3_cache_indices = {}
+        capacity = 1 << (max(num_tokens, 1) - 1).bit_length()
+        key = (device, capacity)
+        if key not in indices:
+            indices[key] = torch.arange(capacity, dtype=torch.int64, device=device)
+        cache_index = indices[key][:num_tokens]
         return kv_cache, kr_cache, cache_index
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):

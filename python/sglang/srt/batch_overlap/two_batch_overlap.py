@@ -810,6 +810,8 @@ class TboForwardBatchPreparer:
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
+                # Model entry initializes each child's per-forward RoPE cache.
+                npu_mlaprolog_rope_cache=None,
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
                 _original_forward_mode=None,

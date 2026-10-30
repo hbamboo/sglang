@@ -849,6 +849,12 @@ class Glm4MoeLiteModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if _is_npu:
+            # Do not reuse warmup results during capture, or previous-step
+            # results when positions are updated in the same tensor storage.
+            forward_batch.npu_mlaprolog_rope_cache = {}
+            for child in getattr(forward_batch, "tbo_children", None) or ():
+                child.npu_mlaprolog_rope_cache = {}
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:

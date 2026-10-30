@@ -509,6 +509,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Position information
     positions: torch.Tensor = None
 
+    # NPU MLA prolog inputs shared by layers within one model forward only.
+    # The model resets this even when the same ForwardBatch is reused by graphs.
+    npu_mlaprolog_rope_cache: Optional[dict] = None
+
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
