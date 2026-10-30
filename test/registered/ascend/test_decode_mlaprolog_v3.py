@@ -84,3 +84,27 @@ def test_real_operator_scratch_and_unified_landing(monkeypatch,page,tokens):
     assert items==[page*576*2]*2
     assert ptrs==[pool.kv_buffer[i].data_ptr() for i in range(2)]
     assert lengths==[pool.kv_buffer[i].nbytes for i in range(2)]
+
+
+@pytest.mark.parametrize('tokens',[1,17,129,1024])
+def test_real_operator_fused_prefill_sink_on_unified_views(tokens):
+    """The torch_npu adapter must preserve sparse writes through strided views."""
+    import torch_npu
+
+    torch.manual_seed(20261030)
+    page=128;blocks=max(2048,tokens*4)//page
+    unified=torch.zeros(blocks,page,1,576,dtype=torch.bfloat16,device='npu:0')
+    packed_k=torch.zeros(blocks,page,1,512,dtype=torch.bfloat16,device='npu:0')
+    packed_r=torch.zeros(blocks,page,1,64,dtype=torch.bfloat16,device='npu:0')
+    def rand(*shape):return torch.randn(*shape,dtype=torch.bfloat16,device='npu:0')
+    x=rand(tokens,1,1,576);gamma=rand(512)
+    cos=rand(tokens,1,1,64);sin=rand(tokens,1,1,64)
+    loc=torch.arange(tokens,dtype=torch.int64,device='npu:0')*3+7
+    kwargs=dict(k_rope_scale=None,c_kv_scale=None,k_rope_offset=None,c_kv_offset=None,
+                epsilon=1e-5,cache_mode='PA_BNSD',is_output_kv=True)
+    expected=torch_npu.npu_kv_rmsnorm_rope_cache(x,gamma,cos,sin,loc,packed_r,packed_k,**kwargs)
+    actual=torch_npu.npu_kv_rmsnorm_rope_cache(x,gamma,cos,sin,loc,unified[...,512:],unified[...,:512],**kwargs)
+    torch.npu.synchronize()
+    assert torch.equal(expected[2],actual[2])
+    assert torch.equal(expected[3],actual[3])
+    assert torch.equal(unified,torch.cat([packed_k,packed_r],dim=-1))
