@@ -19,14 +19,13 @@ if TYPE_CHECKING:
 
 @lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
-    # Legacy MLAPO writes packed split buffers; V3 uses scratch plus scatter.
+    # Legacy MLAPO writes split buffers; V3 supports the fused latent KV pool.
     if (
         envs.ENABLE_ASCEND_FLASH_MLA.get()
         or envs.SGLANG_NPU_MLA_UNIFIED_KV.get()
     ):
-        # The ported MlaPrologV3 path stages its KV in a scratch and lands it
-        # through the pool, so it does run on top of the fused layout; the
-        # legacy int8 prologue still addresses the split buffers and stays off.
+        # V3 writes the fused cache directly, with a scratch compatibility path;
+        # the legacy int8 prologue still addresses split buffers and stays off.
         return is_mlaprolog_v3_enabled()
     # The ported MlaPrologV3 path lives inside the MLAPO prologue, so enabling
     # it implies the fused prologue (and the save_kv_cache=False handshake).
@@ -69,8 +68,8 @@ def is_mlaprolog_v3_enabled() -> bool:
 
 @lru_cache(maxsize=1)
 def is_mlaprolog_v3_direct_cache_enabled() -> bool:
-    """Decode-only direct writes to FlashMLA's interleaved latent cache."""
-    return get_bool_env_var("SGLANG_NPU_MLAPO_V3_DIRECT_CACHE")
+    """Direct writes are enabled by default for compatible FlashMLA decode."""
+    return envs.SGLANG_NPU_MLAPO_V3_DIRECT_CACHE.get()
 
 
 @lru_cache(maxsize=1)
@@ -620,12 +619,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         cos, sin = self.get_sin_cos(positions, forward_batch)
         pool = get_token_to_kv_pool()
         unified_kv = bool(getattr(pool, "flash_mla", False))
-        direct_cache = is_mlaprolog_v3_direct_cache_enabled()
+        direct_cache = (
+            unified_kv
+            and get_attn_backend().use_flash_mla
+            and is_mlaprolog_v3_direct_cache_enabled()
+        )
         if direct_cache:
-            if not unified_kv or not get_attn_backend().use_flash_mla:
-                raise RuntimeError(
-                    "MLA direct cache requires the unified FlashMLA decode path"
-                )
             if pool.store_dtype != torch.bfloat16 or pool.dtype != torch.bfloat16:
                 raise RuntimeError(
                     "MLA direct cache currently requires unquantized BF16 KV"
@@ -711,17 +710,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def _v3_scratch_cache(self, hidden_states, pool):
-        """One step of packed cache for MlaPrologV3 on the fused 576-wide pool.
+        """Packed one-step cache for the compatibility path with direct writes off.
 
-        The kernel assumes ``kv_cache``/``kr_cache`` hold latent and rope in two
-        separate packed buffers (``cacheMode="PA_BSND"`` addresses row
-        ``cache_index[t]`` of a flat ``(rows, headSize)`` view), while the fused
-        pool interleaves both per token, so the prologue writes a throw-away
-        one-step cache here and the rows are landed in the pool afterwards.
-
-        The page dimension below is only there to satisfy the kernel's
-        ``blockSize`` check (16..1024, 16-aligned); it does not have to match the
-        pool's page size because the addressing is flat.
+        The page dimension satisfies the kernel's blockSize constraint; slot
+        indices address only this step. Direct writes use the final pool views.
         """
         if pool.store_dtype != pool.dtype:
             raise NotImplementedError(
