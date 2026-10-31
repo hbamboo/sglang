@@ -11,7 +11,7 @@ from sglang.srt.hardware_backend.npu.attention import flash_mla_adapter as adapt
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu import memory_pool_npu as pools
 
-@pytest.mark.parametrize('tokens',[1,7,32,64,92])
+@pytest.mark.parametrize('tokens',[1,7,9,10,11,32,64,92])
 @pytest.mark.parametrize('direct_cache',[False,True])
 def test_wrapper_to_flashmla(monkeypatch,tokens,direct_cache):
     torch.manual_seed(42)
@@ -73,7 +73,7 @@ def test_wrapper_to_flashmla(monkeypatch,tokens,direct_cache):
     result=AscendAttnBackend._fmla_decode(backend,out[2],out[0],layer,batch,tokens)
     assert seen and result.shape==(tokens,20*512)
 
-@pytest.mark.parametrize('tokens',[1,7,64])
+@pytest.mark.parametrize('tokens',[1,7,9,10,11,64])
 def test_real_flashmla(tokens):
     torch.manual_seed(42)
     full=torch.randn(tokens,1,20,576,device='npu:0',dtype=torch.bfloat16)
