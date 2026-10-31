@@ -9,8 +9,10 @@ import torch
 
 from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     ExpandedKVGeometry,
+    can_fuse_expanded_kv,
     expanded_kv_geometry,
     forward_expanded_prefill,
+    get_prefill_expanded_geometry,
 )
 
 
@@ -63,6 +65,7 @@ def test_pd_registration_stays_latent(monkeypatch):
 def test_pool_sizing_includes_expanded(monkeypatch):
     import sglang.srt.model_executor.pool_configurator as sizing
     import sglang.srt.layers.cp.utils as cp_utils
+    import sglang.srt.runtime_context as runtime
     from sglang.srt.environ import envs
 
     config = SimpleNamespace(
@@ -78,21 +81,127 @@ def test_pool_sizing_includes_expanded(monkeypatch):
     monkeypatch.setattr(cp_utils, "get_parallel", lambda: parallel)
     monkeypatch.setattr(sizing, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="prefill"))
     monkeypatch.setattr(sizing, "get_memory", lambda: SimpleNamespace(enable_hierarchical_cache=False))
+    monkeypatch.setattr(runtime, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(runtime, "get_disagg", sizing.get_disagg)
+    monkeypatch.setattr(runtime, "get_memory", sizing.get_memory)
     kvc = SimpleNamespace(
         model_config=config, kv_cache_dtype=torch.bfloat16, use_mla_backend=True,
         device="npu", spec_algorithm=SimpleNamespace(is_none=lambda: True),
         is_draft_worker=False,
     )
     configurator = sizing.DefaultPoolConfigurator.__new__(sizing.DefaultPoolConfigurator)
-    monkeypatch.setenv("SGLANG_NPU_PREFILL_EXPANDED_KV", "1")
+    monkeypatch.delenv("SGLANG_NPU_PREFILL_EXPANDED_KV", raising=False)
     assert envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get()
     assert configurator._compute_cell_size(kvc, 47) == 1_016_704
+    assert configurator._expanded_prefill_kv
     configurator._cell_size = 1_016_704
-    configurator._expanded_prefill_kv = True
     budget = (1024 + 128) * configurator._cell_size
     assert configurator.calculate_pool_sizes(budget, 128).max_total_num_tokens == 1024
     monkeypatch.setenv("SGLANG_NPU_PREFILL_EXPANDED_KV", "0")
     assert configurator._compute_cell_size(kvc, 47) == 54_144
+    assert not configurator._expanded_prefill_kv
+    monkeypatch.delenv("SGLANG_NPU_PREFILL_EXPANDED_KV")
+    monkeypatch.setattr(runtime, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="decode"))
+    assert configurator._compute_cell_size(kvc, 47) == 54_144
+    assert not configurator._expanded_prefill_kv
+
+
+@pytest.fixture
+def expanded_config(monkeypatch):
+    import sglang.srt.runtime_context as runtime
+
+    monkeypatch.delenv("SGLANG_NPU_PREFILL_EXPANDED_KV", raising=False)
+    monkeypatch.delenv("SGLANG_NPU_PREFILL_FUSED_KV_SCATTER", raising=False)
+    model = SimpleNamespace(
+        num_attention_heads=20, qk_nope_head_dim=192, qk_rope_head_dim=64,
+        kv_lora_rank=512, v_head_dim=256,
+        hf_config=SimpleNamespace(architectures=["Glm4MoeLiteForCausalLM"]),
+    )
+    parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=1, attn_cp_size=1)
+    disagg = SimpleNamespace(disaggregation_mode="prefill")
+    memory = SimpleNamespace(enable_hierarchical_cache=False)
+    kvc = SimpleNamespace(
+        model_config=model, device="npu", use_mla_backend=True,
+        kv_cache_dtype=torch.bfloat16, spec_algorithm=SimpleNamespace(is_none=lambda: True),
+    )
+    monkeypatch.setattr(runtime, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(runtime, "get_disagg", lambda: disagg)
+    monkeypatch.setattr(runtime, "get_memory", lambda: memory)
+    return kvc, parallel, disagg, memory
+
+
+def test_default_flags_and_explicit_rollback(monkeypatch, expanded_config):
+    from sglang.srt.environ import envs
+
+    kvc, _, _, _ = expanded_config
+    assert get_prefill_expanded_geometry(kvc) == ExpandedKVGeometry(20, 256, 256)
+    for flag in (envs.SGLANG_NPU_PREFILL_EXPANDED_KV, envs.SGLANG_NPU_PREFILL_FUSED_KV_SCATTER):
+        assert flag.get()
+        monkeypatch.setenv(flag.name, "0")
+        assert not flag.get()
+        monkeypatch.setenv(flag.name, "1")
+        assert flag.get()
+    monkeypatch.setenv("SGLANG_NPU_PREFILL_EXPANDED_KV", "0")
+    assert get_prefill_expanded_geometry(kvc) is None
+
+
+@pytest.mark.parametrize("case", [
+    "decode", "standalone", "cpu", "cuda", "mha", "fp32", "dcp", "cp",
+    "speculation", "hicache", "unequal_dims", "head_divisibility", "dsa",
+])
+def test_default_skips_unsupported_but_explicit_enable_rejects(monkeypatch, expanded_config, case):
+    kvc, parallel, disagg, memory = expanded_config
+    if case == "decode":
+        disagg.disaggregation_mode = "decode"
+    elif case == "standalone":
+        disagg.disaggregation_mode = "null"
+    elif case in ("cpu", "cuda"):
+        kvc.device = case
+    elif case == "mha":
+        kvc.use_mla_backend = False
+    elif case == "fp32":
+        kvc.kv_cache_dtype = torch.float32
+    elif case == "dcp":
+        parallel.attn_dcp_size = 2
+    elif case == "cp":
+        parallel.attn_cp_size = 2
+    elif case == "speculation":
+        kvc.spec_algorithm.is_none = lambda: False
+    elif case == "hicache":
+        memory.enable_hierarchical_cache = True
+    elif case == "unequal_dims":
+        kvc.model_config.v_head_dim = 128
+    elif case == "head_divisibility":
+        parallel.attn_tp_size = 3
+    elif case == "dsa":
+        monkeypatch.setattr("sglang.srt.configs.model_config.is_deepseek_dsa", lambda config: True)
+    assert get_prefill_expanded_geometry(kvc) is None
+    monkeypatch.setenv("SGLANG_NPU_PREFILL_EXPANDED_KV", "1")
+    with pytest.raises(ValueError):
+        get_prefill_expanded_geometry(kvc)
+
+
+def test_fused_default_dispatch_guards(monkeypatch, expanded_config):
+    import sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph as piecewise
+
+    monkeypatch.setattr(piecewise, "get_tc_piecewise_forward_context", lambda: None)
+    pool = SimpleNamespace(prefill_expanded_geometry=ExpandedKVGeometry(20, 256, 256))
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: True), extend_prefix_lens_cpu=[128],
+    )
+    projection = torch.empty(2, 20, 448, dtype=torch.bfloat16)
+    rope = torch.empty(2, 1, 64, dtype=torch.bfloat16)
+    assert can_fuse_expanded_kv(pool, batch, projection, rope)
+    monkeypatch.setenv("SGLANG_NPU_PREFILL_FUSED_KV_SCATTER", "0")
+    assert not can_fuse_expanded_kv(pool, batch, projection, rope)
+    monkeypatch.delenv("SGLANG_NPU_PREFILL_FUSED_KV_SCATTER")
+    batch.extend_prefix_lens_cpu = [0]
+    assert not can_fuse_expanded_kv(pool, batch, projection, rope)
+    batch.extend_prefix_lens_cpu = [128]
+    assert not can_fuse_expanded_kv(pool, batch, projection.float(), rope)
+    assert not can_fuse_expanded_kv(pool, batch, projection.transpose(0, 1), rope)
+    monkeypatch.setattr(piecewise, "get_tc_piecewise_forward_context", object)
+    assert not can_fuse_expanded_kv(pool, batch, projection, rope)
 
 
 @pytest.mark.skipif(not os.environ.get("P_KV_TEST_DEVICE"), reason="NPU opt-in")

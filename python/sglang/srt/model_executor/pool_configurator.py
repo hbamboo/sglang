@@ -185,8 +185,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
+        self._expanded_prefill_kv = False
         self._cell_size = self._compute_cell_size(kvc, num_layers)
-        self._expanded_prefill_kv = envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get()
         self._transient_prefill_reserve_bytes = _npu_prefill_transient_reserve_bytes(
             kvc
         )
@@ -284,28 +284,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
 
-        expanded_geometry = None
-        if envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get():
-            if (
-                not str(kvc.device).startswith("npu")
-                or not kvc.use_mla_backend
-                or get_disagg().disaggregation_mode != "prefill"
-                or is_deepseek_dsa(model_config.hf_config)
-                or kv_cache_dtype not in (torch.bfloat16, torch.float16)
-                or dcp_size != 1
-                or get_parallel().attn_cp_size != 1
-                or not kvc.spec_algorithm.is_none()
-                or get_memory().enable_hierarchical_cache
-            ):
-                raise ValueError(
-                    "SGLANG_NPU_PREFILL_EXPANDED_KV requires dense NPU MLA PD prefill, "
-                    "BF16/FP16 KV, CP=1, and no speculation or hierarchical cache"
-                )
-            from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
-                expanded_kv_geometry,
-            )
+        from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
+            get_prefill_expanded_geometry,
+        )
 
-            expanded_geometry = expanded_kv_geometry(model_config, tp_size)
+        expanded_geometry = get_prefill_expanded_geometry(kvc)
+        self._expanded_prefill_kv = expanded_geometry is not None
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (

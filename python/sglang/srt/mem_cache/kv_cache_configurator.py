@@ -1450,15 +1450,11 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
-        prefill_expanded_geometry = None
-        if envs.SGLANG_NPU_PREFILL_EXPANDED_KV.get():
-            from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
-                expanded_kv_geometry,
-            )
+        from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
+            get_prefill_expanded_geometry,
+        )
 
-            prefill_expanded_geometry = expanded_kv_geometry(
-                self.model_config, get_parallel().attn_tp_size
-            )
+        prefill_expanded_geometry = get_prefill_expanded_geometry(self)
 
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,

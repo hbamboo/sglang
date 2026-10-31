@@ -10,12 +10,20 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_for_batch,
 )
+from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
+    PackedExpandedKV,
+    can_fuse_expanded_kv,
+    forward_expanded_prefill,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -121,6 +129,10 @@ def forward_mha_prepare_npu(
 
     kv = m.kv_b_proj(kv_a)[0]
     kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
+    if not m.use_dsa and can_fuse_expanded_kv(
+        get_token_to_kv_pool(), forward_batch, kv, k_pe
+    ):
+        return q, PackedExpandedKV(kv, k_pe, m.qk_nope_head_dim), None, forward_batch
     k_nope = kv[..., : m.qk_nope_head_dim]
     v = kv[..., m.qk_nope_head_dim :].contiguous()
 
@@ -139,7 +151,19 @@ def forward_mha_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+    if isinstance(k, PackedExpandedKV):
+        with torch.profiler.record_function("npu_prefill_expanded_kv_fused"):
+            attn_output = forward_expanded_prefill(
+                get_attn_backend(),
+                q,
+                None,
+                None,
+                m.attn_mha,
+                forward_batch,
+                packed_kv=k,
+            )
+    else:
+        attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
         attn_output = m._apply_gated(attn_output, gate)

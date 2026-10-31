@@ -1,17 +1,30 @@
 # Dense MLA prefill expanded KV
 
-`SGLANG_NPU_PREFILL_EXPANDED_KV=1` enables an expanded K/V cache on a dense
-Ascend MLA **prefill** worker. The decode worker keeps the existing latent KV.
-The flag defaults to off and currently requires ordinary PD prefill, BF16/FP16
-KV, equal K/V head dimensions, CP=1, no speculative decoding and no HiCache.
-For this base revision, set `ENABLE_ASCEND_FLASH_MLA=1` on both workers to
-select the matching unified latent transfer layout. P still computes MHA/FIA;
-D uses FlashMLA. The provided launcher sets this consistently.
+Expanded K/V caching and fused ScatterPaKvCache writes are enabled by default
+on supported dense Ascend MLA **prefill** workers. They require ordinary PD
+prefill, BF16/FP16 KV, equal K/V head dimensions, CP=1, no speculative decoding
+and no HiCache. Decode and other unsupported workers retain their existing KV
+path when the environment is unset. Explicitly requesting expanded KV with an
+unsupported configuration still raises an error.
+
+Set `SGLANG_NPU_PREFILL_EXPANDED_KV=0` to disable the expanded cache, or set
+`SGLANG_NPU_PREFILL_FUSED_KV_SCATTER=0` to retain expanded KV with the original
+layout and scatter operations. Fused writes require the ScatterPaKvCache module
+in sgl-kernel-npu (commit `698e1c71bd0b` or equivalent). Prefix batches fuse K/V
+splitting, K-RoPE assembly and paged writes; no-prefix batches retain contiguous
+FIA inputs and use one joint K/V scatter. MLA Prolog V3 and FlashMLA keep their
+existing opt-in settings.
+
+When opting into FlashMLA decode, set `ENABLE_ASCEND_FLASH_MLA=1` on both workers
+to select the matching unified latent transfer layout. P still computes MHA/FIA;
+D uses FlashMLA. The provided launcher sets this consistently. With FlashMLA
+disabled on both workers, the existing split latent layout remains available.
 
 The prefill pool owns three buffers per layer:
 
-- The original unified 576-wide latent buffer is the only buffer registered
-  for PD transfer. Decode receives exactly the existing cache layout.
+- The original latent KV is the only cache registered for PD transfer. With
+  FlashMLA it is one unified 576-wide buffer; otherwise the existing split
+  buffers are retained. Decode receives the matching latent cache layout.
 - Separate contiguous paged K/V buffers hold the already expanded projection
   outputs. New tokens are scattered once. Radix-cache entries reuse the same
   allocator slots in all buffers.
@@ -31,8 +44,9 @@ is deliberately absent from `get_contiguous_buf_infos()`.
 There is no expanded-KV-to-latent conversion at the PD boundary. The existing
 MHA preparation first computes the normalized latent and RoPE key, writes that
 latent cache, and then applies the current-token `kv_b_proj` to produce K/V.
-The new path additionally saves those expanded outputs with two scatter writes
-per layer. PD transfers the already available latent cache; its per-token payload
+The new path additionally saves those expanded outputs with one fused scatter
+write per layer by default. PD transfers the already available latent cache; its
+per-token payload
 and decode layout are unchanged. Latent generation and its cache write already
 exist in the baseline. The added expanded-cache writes are part of measured
 prefill latency, and client E2E includes both PD transfer and subsequent decode.

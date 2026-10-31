@@ -687,6 +687,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def set_prefill_expanded_kv(self, layer_id, loc, key, value):
         geometry = self.prefill_expanded_geometry
         key_cache, value_cache = self.get_prefill_expanded_kv(layer_id)
+        if envs.SGLANG_NPU_PREFILL_FUSED_KV_SCATTER.get():
+            from sgl_kernel_npu.scatter_pa_kv_cache import scatter_pa_kv_cache
+
+            scatter_pa_kv_cache(key, key_cache, loc, value, value_cache)
+            return
         indices = loc.to(dtype=torch.int64).view(-1, 1)
         for cache, rows, dim in (
             (key_cache, key, geometry.key_dim),

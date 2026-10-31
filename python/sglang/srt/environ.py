@@ -752,9 +752,11 @@ class Envs:
     # decode on Ascend 950PR/950DT.  Also switches the NPU MLA KV pool to one
     # contiguous 576-wide latent buffer (see flash_mla_adapter.py).
     ENABLE_ASCEND_FLASH_MLA = EnvBool(False)
-    # P-only expanded K/V cache consumed directly by paged FIA. The latent
-    # cache remains allocated and is the only cache registered for PD transfer.
-    SGLANG_NPU_PREFILL_EXPANDED_KV = EnvBool(False)
+    # Default on for supported dense NPU MLA PD prefill. Other workers retain
+    # latent KV; set to 0 to disable the expanded cache on supported workers.
+    SGLANG_NPU_PREFILL_EXPANDED_KV = EnvBool(True)
+    # Fuse packed MLA K/V assembly and paged writes; requires updated sgl-kernel-npu.
+    SGLANG_NPU_PREFILL_FUSED_KV_SCATTER = EnvBool(True)
     # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
     # Set only on P. Zero preserves the existing capacity calculation.
     SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB = EnvInt(0)
