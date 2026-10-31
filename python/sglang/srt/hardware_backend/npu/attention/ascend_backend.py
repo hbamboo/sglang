@@ -970,10 +970,9 @@ class AscendAttnBackend(AttentionBackend):
         """flash_mla decode for the absorbed latent MLA path.
 
         ``q`` is q_nope ``(tokens, tp_q_head_num, 512)`` and ``q_rope`` is
-        q_pe ``(tokens, tp_q_head_num, 64)``; the op wants them concatenated
-        per token.  That cat is O(tokens x heads x 576) and lives only for the
-        duration of the call -- the KV cache itself is already stored
-        interleaved, so nothing proportional to the context is copied.
+        q_pe ``(tokens, tp_q_head_num, 64)``. V3 writes both components into
+        a shared 576-wide query, which the adapter reuses without a device
+        copy. Other prologues retain the concatenate fallback.
         """
         block_tables = self.forward_metadata.block_tables
         bs = block_tables.shape[0]
@@ -990,12 +989,9 @@ class AscendAttnBackend(AttentionBackend):
             num_q_heads=num_heads,
             cache_seqlens=seqused,
         )
-        q_full = torch.cat(
-            [
-                q[:bs].reshape(bs, 1, num_heads, self.kv_lora_rank),
-                q_rope[:bs].reshape(bs, 1, num_heads, self.qk_rope_head_dim),
-            ],
-            dim=-1,
+        q_full = fmla_adapter.combine_query(
+            q[:bs].reshape(bs, 1, num_heads, self.kv_lora_rank),
+            q_rope[:bs].reshape(bs, 1, num_heads, self.qk_rope_head_dim),
         )
         k_cache = self.token_to_kv_pool.get_flash_mla_kv_buffer(layer.layer_id)
         attn_output = fmla_adapter.decode(

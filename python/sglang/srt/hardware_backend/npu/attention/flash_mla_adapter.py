@@ -69,6 +69,31 @@ _MASK_SIZE = 2048
 _CAUSAL_MASK_CACHE: dict = {}
 
 
+def combine_query(q: torch.Tensor, q_rope: torch.Tensor) -> torch.Tensor:
+    """Reuse adjacent component views of an interleaved query, or concatenate.
+
+    All checks inspect tensor metadata, so capture records no copy or cat node
+    for MlaPrologV3's packed output. Independent legacy tensors still work.
+    """
+    width = q.shape[-1] + q_rope.shape[-1]
+    shape = (*q.shape[:-1], width)
+    stride = q.stride()
+    if (
+        q.shape[:-1] == q_rope.shape[:-1]
+        and q.dtype == q_rope.dtype
+        and q.device == q_rope.device
+        and q.stride() == q_rope.stride()
+        and stride[-1] == 1
+        and stride[-2] == width
+        and q.untyped_storage().data_ptr() == q_rope.untyped_storage().data_ptr()
+        and q_rope.storage_offset() == q.storage_offset() + q.shape[-1]
+    ):
+        full = q.as_strided(shape, stride)
+        if full.is_contiguous():
+            return full
+    return torch.cat([q, q_rope], dim=-1)
+
+
 def _as_int32(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if t is None:
         return None

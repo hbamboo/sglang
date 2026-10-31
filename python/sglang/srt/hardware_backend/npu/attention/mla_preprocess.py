@@ -649,7 +649,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             kr_cache = v_cache.view(-1, page_size, 1, self.qk_rope_head_dim)
             cache_index = slot_mapping.to(dtype=torch.int64)
 
-        q_nope, q_pe, _, q_norm, _ = torch.ops.npu.mla_prolog_v3(
+        # V3 is decode-only. FlashMLA consumes a single interleaved query;
+        # retain component views for the existing prologue/attention interface.
+        packed_query = get_attn_backend().use_flash_mla and get_bool_env_var(
+            "SGLANG_NPU_MLAPO_V3_PACKED_QUERY", "true"
+        )
+        if packed_query:
+            from sgl_kernel_npu.mla_prolog_v3 import mla_prolog_v3
+
+            prolog = mla_prolog_v3
+        else:
+            prolog = torch.ops.npu.mla_prolog_v3
+        q_nope, q_pe, _, q_norm, _ = prolog(
             token_x=hidden_states,
             weight_dq=self.weight_dq,
             weight_uq_qr=self.weight_uq_qr,
@@ -667,6 +678,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             cache_mode="PA_BSND",
             query_norm_flag=True,
             weight_quant_mode=0,  # weights are bf16 (dequantised above)
+            **({"packed_query": True} if packed_query else {}),
         )
 
         if unified_kv and not direct_cache:
