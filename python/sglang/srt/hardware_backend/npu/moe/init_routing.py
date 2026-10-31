@@ -11,6 +11,9 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_disagg
+
 # ``npu_moe_init_routing_v2`` quant_mode selecting MXFP8: the op emits an
 # float8_e4m3fn payload plus an e8m0 block scale, fusing the activation quant
 # that would otherwise need a separate ``npu_dynamic_mx_quant`` pass.
@@ -27,6 +30,33 @@ def _normalize_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale is None or scale.ndim != 2:
         return scale
     return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
+
+
+def _can_prequantize_mxfp8(
+    hidden_states, topk_ids, num_experts, top_k, quant_mode
+):
+    """Keep the default and all unqualified routes on the existing fused kernel."""
+    if (
+        quant_mode != MXFP8_QUANT_MODE
+        or not envs.SGLANG_NPU_MOE_PREQUANT_ROUTING.get()
+    ):
+        return False
+    return (
+        hidden_states.device.type == "npu"
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.ndim == 2
+        and 8192 <= hidden_states.shape[0] <= 36000
+        and hidden_states.shape[1] == 2048
+        and hidden_states.is_contiguous()
+        and top_k == 4
+        and num_experts == 64
+        and topk_ids.shape == (hidden_states.shape[0], 4)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.device == hidden_states.device
+        and topk_ids.is_contiguous()
+        and hasattr(torch, "float8_e8m0fnu")
+        and get_disagg().disaggregation_mode == "prefill"
+    )
 
 
 class BaseInitRouting(ABC):
@@ -98,6 +128,27 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
+        prequant = _can_prequantize_mxfp8(
+            hidden_states, topk_ids, num_experts, top_k, self.quant_mode
+        )
+        scale_args = {}
+        if prequant:
+            # Quantize distinct rows once, instead of once per expanded top-k row.
+            # The dispatcher still sees the original BF16 tensor, preserving its
+            # top-k weight dtype and the router/shared-expert input contract.
+            hidden_states, scale = torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states,
+                axis=-1,
+                round_mode="rint",
+                dst_type=torch.float8_e4m3fn,
+                block_size=32,
+                scale_alg=0,
+            )
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e8m0fnu)
+            if scale.dtype != torch.float8_e8m0fnu:
+                raise RuntimeError("Prequantized MoE routing requires E8M0 scale bytes")
+            scale_args["scale"] = scale
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
@@ -107,7 +158,8 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
-                quant_mode=self.quant_mode,
+                quant_mode=-1 if prequant else self.quant_mode,
+                **scale_args,
             )
         )
         if self.quant_mode == -1:

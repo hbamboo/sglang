@@ -87,7 +87,9 @@ def forward_mha_prepare_npu(
     if m.use_deepseek_yarn_rope:
         B, S = q.shape[0], 1
         cos, sin = m.rotary_emb.get_cos_sin_cache(
-            positions, hidden_states.dtype, offsets=None
+            # Input-norm fusion can pass (FP8 values, scales). The Q projection
+            # still emits the original BF16 attention dtype, not FP8.
+            positions, q.dtype, offsets=None
         )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),

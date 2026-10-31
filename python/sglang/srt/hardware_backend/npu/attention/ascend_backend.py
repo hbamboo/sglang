@@ -108,6 +108,11 @@ class ForwardMetadata:
     # mapped block_tables for swa
     block_tables_swa: Optional[torch.Tensor] = None
 
+    # Eager-only FAS state. init_forward_metadata constructs a fresh
+    # ForwardMetadata each step; never place these in a global cache.
+    prefill_fas_decision: Optional[object] = None
+    prefill_fas_staging: Optional[object] = None
+
     # pre-translated full->SWA write target for SWAKVPool.set_kv_buffer
     swa_out_cache_loc: Optional[torch.Tensor] = None
 

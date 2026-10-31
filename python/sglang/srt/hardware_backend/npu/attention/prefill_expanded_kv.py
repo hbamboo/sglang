@@ -47,9 +47,9 @@ def can_fuse_expanded_kv(pool, forward_batch, projection, k_rope):
         envs.SGLANG_NPU_PREFILL_FUSED_KV_SCATTER.get()
         and geometry is not None
         and forward_batch.forward_mode.is_extend()
-        and (any(forward_batch.extend_prefix_lens_cpu) or supports_dense_kv_outputs())
         and not torch.compiler.is_compiling()
         and get_tc_piecewise_forward_context() is None
+        and (any(forward_batch.extend_prefix_lens_cpu) or supports_dense_kv_outputs())
         and projection.dtype in (torch.bfloat16, torch.float16)
         and projection.dtype == k_rope.dtype
         and projection.is_contiguous()
@@ -150,7 +150,20 @@ def forward_expanded_prefill(backend, q, k, v, layer, forward_batch, *, packed_k
             **dense_outputs,
         )
     metadata = backend.forward_metadata
-    if not has_prefix:
+    from sglang.srt.environ import envs
+
+    fas_output = None
+    if envs.SGLANG_NPU_PREFILL_FAS.get():
+        from sglang.srt.hardware_backend.npu.attention.prefill_fas import (
+            maybe_forward_expanded_prefill_fas,
+        )
+
+        fas_output = maybe_forward_expanded_prefill_fas(
+            backend, query[:tokens], layer, forward_batch
+        )
+    if fas_output is not None:
+        output = fas_output
+    elif not has_prefix:
         # No-prefix fusion emits the same contiguous K/V rows consumed by FIA
         # while also caching them, avoiding the five separate layout kernels.
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(

@@ -757,6 +757,10 @@ class Envs:
     SGLANG_NPU_PREFILL_EXPANDED_KV = EnvBool(True)
     # Fuse packed MLA K/V assembly and paged writes; requires updated sgl-kernel-npu.
     SGLANG_NPU_PREFILL_FUSED_KV_SCATTER = EnvBool(True)
+    # Eager FAS candidate for guarded large expanded PD-prefill batches.
+    SGLANG_NPU_PREFILL_FAS = EnvBool(False)
+    # Reuse existing MXFP8 once before top-k expansion on measured large PD prefill.
+    SGLANG_NPU_MOE_PREQUANT_ROUTING = EnvBool(False)
     # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
     # Set only on P. Zero preserves the existing capacity calculation.
     SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB = EnvInt(0)

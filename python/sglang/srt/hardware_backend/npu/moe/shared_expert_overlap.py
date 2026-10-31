@@ -152,10 +152,15 @@ class SharedExpertOverlap:
         self.gmm1_done.record(self.main)
         self.stream.wait_event(self.gmm1_done)
         with torch.npu.stream(self.stream), self._label("shared_overlap/swiglu_quant"):
-            activated = self.shared.act_fn(self.gate_up)
-            self.quantized, self.scales = torch.ops.npu.npu_dynamic_mx_quant(
-                activated, dst_type=torch.float8_e4m3fn
+            activated = self.shared.act_fn(
+                self.gate_up, quant_linear=self.shared.down_proj
             )
+            if isinstance(activated, tuple):
+                self.quantized, self.scales = activated
+            else:
+                self.quantized, self.scales = torch.ops.npu.npu_dynamic_mx_quant(
+                    activated, dst_type=torch.float8_e4m3fn
+                )
         self.gate_up = None
         self.stage = 2
 

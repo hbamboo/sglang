@@ -70,15 +70,28 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.attention_forward_methods import AttnForwardMethod
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_spec,
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -92,6 +105,66 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+_NPU_GLM_PREFILL_QKV_NORM_FUSION = _is_npu and get_bool_env_var(
+    "SGLANG_NPU_GLM_PREFILL_QKV_NORM_FUSION", "0"
+)
+
+
+def _glm_prefill_qkv_norm_consumer(layer, hidden_states, residual, forward_batch):
+    """Limit the tuple producer to ordinary eager single-rank PD prefill.
+
+    Post-attention norm is deliberately excluded: its MoE router needs BF16.
+    The RMSNorm implementation retains its own dtype/weight/fusion gate.
+    """
+    if not _NPU_GLM_PREFILL_QKV_NORM_FUSION:
+        return None
+    if (
+        residual is None
+        or not isinstance(hidden_states, torch.Tensor)
+        or hidden_states.dim() != 2
+        or hidden_states.dtype != torch.bfloat16
+        or hidden_states.shape[0] == 0
+        or forward_batch.forward_mode != ForwardMode.EXTEND
+        or forward_batch.spec_info is not None
+        or forward_batch.can_run_tbo
+        or get_is_capture_mode()
+        or torch.compiler.is_compiling()
+    ):
+        return None
+    if (
+        get_disagg().disaggregation_mode != "prefill"
+        or get_spec().speculative_algorithm is not None
+        or is_dp_attention_enabled()
+        or get_attn_tp_context().input_scattered
+    ):
+        return None
+    parallel = get_parallel()
+    if any(
+        getattr(parallel, width) != 1
+        for width in (
+            "world_size",
+            "tp_size",
+            "attn_tp_size",
+            "attn_dp_size",
+            "attn_cp_size",
+            "attn_dcp_size",
+        )
+    ):
+        return None
+    graph_config = get_exec().graph.cuda_graph_config
+    if graph_config is not None and graph_config.prefill.backend != Backend.DISABLED:
+        return None
+    attn = layer.self_attn
+    consumer = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+    if (
+        attn.use_dsa
+        or attn.q_lora_rank is None
+        or hasattr(attn, "q_a_proj")
+        or not getattr(consumer, "_sgl_npu_mx_quant_fusable", False)
+        or attn.dispatch_attn_forward_method(forward_batch) != AttnForwardMethod.MHA_NPU
+    ):
+        return None
+    return consumer
 
 
 class Glm4MoeLiteMLP(nn.Module):
@@ -143,7 +216,9 @@ class Glm4MoeLiteMLP(nn.Module):
             return x
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        # The NPU activation only emits MXFP8 (values, scales) when its
+        # existing fusion flag and the downstream linear's contract allow it.
+        x = self.act_fn(gate_up, quant_linear=self.down_proj)
         x, _ = self.down_proj(x)
         return x
 
@@ -691,6 +766,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             residual,
             forward_batch,
             getattr(self, "_gfx95_quant_format", ""),
+            quant_linear=_glm_prefill_qkv_norm_consumer(
+                self, hidden_states, residual, forward_batch
+            ),
         )
 
         hidden_states = self.self_attn(
