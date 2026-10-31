@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     ExpandedKVGeometry,
+    PackedExpandedKV,
     can_fuse_expanded_kv,
     expanded_kv_geometry,
     forward_expanded_prefill,
@@ -196,12 +197,52 @@ def test_fused_default_dispatch_guards(monkeypatch, expanded_config):
     assert not can_fuse_expanded_kv(pool, batch, projection, rope)
     monkeypatch.delenv("SGLANG_NPU_PREFILL_FUSED_KV_SCATTER")
     batch.extend_prefix_lens_cpu = [0]
+    monkeypatch.setattr("sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv.supports_dense_kv_outputs", lambda: False)
     assert not can_fuse_expanded_kv(pool, batch, projection, rope)
+    monkeypatch.setattr("sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv.supports_dense_kv_outputs", lambda: True)
+    assert can_fuse_expanded_kv(pool, batch, projection, rope)
     batch.extend_prefix_lens_cpu = [128]
     assert not can_fuse_expanded_kv(pool, batch, projection.float(), rope)
     assert not can_fuse_expanded_kv(pool, batch, projection.transpose(0, 1), rope)
     monkeypatch.setattr(piecewise, "get_tc_piecewise_forward_context", object)
     assert not can_fuse_expanded_kv(pool, batch, projection, rope)
+
+
+@pytest.mark.skipif(not os.environ.get("P_KV_TEST_DEVICE"), reason="NPU opt-in")
+@pytest.mark.parametrize("n,padding", [(0, 7), (17, 0), (129, 7)])
+def test_no_prefix_packed_outputs_match_explicit_kv(monkeypatch, n, padding):
+    torch.set_num_threads(4)
+    device = os.environ["P_KV_TEST_DEVICE"]
+    torch.npu.set_device(device)
+    pool = make_pool(monkeypatch, device, layers=1, pages=4)
+    kc, vc = pool.get_prefill_expanded_kv(3)
+    x = torch.randn(n, 20, 448, device=device, dtype=torch.bfloat16)
+    rope = torch.randn(n, 1, 64, device=device, dtype=x.dtype)
+    q = torch.randn(n + padding, 20, 256, device=device, dtype=x.dtype) * 0.2
+    slots = torch.randperm(3 * 128, device=device)[:n]
+    batch = SimpleNamespace(num_token_non_padded_cpu=n, out_cache_loc=slots, extend_prefix_lens_cpu=[0])
+    backend = SimpleNamespace(
+        token_to_kv_pool=pool,
+        forward_metadata=SimpleNamespace(seq_lens_list_cumsum=[n]),
+        fia_mask=torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=device), diagonal=1),
+    )
+    layer = SimpleNamespace(layer_id=3, tp_k_head_num=20, tp_q_head_num=20,
+                            qk_head_dim=256, v_head_dim=256, scaling=1 / 16)
+    latent_before = pool.kv_buffer.clone()
+    kc.fill_(-3); vc.fill_(5)
+    expected = forward_expanded_prefill(
+        backend, q, torch.cat((x[..., :192], rope.expand(-1, 20, -1)), dim=-1),
+        x[..., 192:].contiguous(), layer, batch,
+    )
+    expected_k, expected_v = kc.clone(), vc.clone()
+    kc.fill_(-3); vc.fill_(5)
+    actual = forward_expanded_prefill(
+        backend, q, None, None, layer, batch, packed_kv=PackedExpandedKV(x, rope, 192),
+    )
+    torch.npu.synchronize()
+    assert torch.equal(actual, expected)
+    assert torch.equal(kc, expected_k) and torch.equal(vc, expected_v)
+    assert torch.equal(pool.kv_buffer, latent_before)
 
 
 @pytest.mark.skipif(not os.environ.get("P_KV_TEST_DEVICE"), reason="NPU opt-in")

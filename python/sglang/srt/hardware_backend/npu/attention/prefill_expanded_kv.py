@@ -1,6 +1,7 @@
 """Paged expanded KV for dense MLA prefillers; latent KV remains the PD ABI."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,18 @@ class PackedExpandedKV:
     nope_dim: int
 
 
+@lru_cache(maxsize=1)
+def supports_dense_kv_outputs():
+    """Older kernel wheels retain the existing no-prefix fallback."""
+    import torch
+
+    try:
+        schema = torch.ops.npu.scatter_pa_kv_cache_mla.default._schema
+        return {"key_out", "value_out"}.issubset(arg.name for arg in schema.arguments)
+    except (AttributeError, RuntimeError):
+        return False
+
+
 def can_fuse_expanded_kv(pool, forward_batch, projection, k_rope):
     import torch
     from sglang.srt.environ import envs
@@ -34,7 +47,7 @@ def can_fuse_expanded_kv(pool, forward_batch, projection, k_rope):
         envs.SGLANG_NPU_PREFILL_FUSED_KV_SCATTER.get()
         and geometry is not None
         and forward_batch.forward_mode.is_extend()
-        and any(forward_batch.extend_prefix_lens_cpu)
+        and (any(forward_batch.extend_prefix_lens_cpu) or supports_dense_kv_outputs())
         and not torch.compiler.is_compiling()
         and get_tc_piecewise_forward_context() is None
         and projection.dtype in (torch.bfloat16, torch.float16)
@@ -110,6 +123,7 @@ def forward_expanded_prefill(backend, q, k, v, layer, forward_batch, *, packed_k
     query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
     if tokens == 0:
         return query.new_zeros((query.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+    has_prefix = any(forward_batch.extend_prefix_lens_cpu)
     if packed_kv is None:
         pool.set_prefill_expanded_kv(
             layer.layer_id,
@@ -120,9 +134,12 @@ def forward_expanded_prefill(backend, q, k, v, layer, forward_batch, *, packed_k
     else:
         from sgl_kernel_npu.scatter_pa_kv_cache import scatter_pa_kv_cache_mla
 
-        if not any(forward_batch.extend_prefix_lens_cpu):
-            raise ValueError("Packed expanded KV requires the paged prefix path")
         key_cache, value_cache = pool.get_prefill_expanded_kv(layer.layer_id)
+        dense_outputs = {}
+        if not has_prefix:
+            k = packed_kv.projection.new_empty(tokens, geometry.heads, geometry.key_dim)
+            v = packed_kv.projection.new_empty(tokens, geometry.heads, geometry.value_dim)
+            dense_outputs = {"key_out": k, "value_out": v}
         scatter_pa_kv_cache_mla(
             packed_kv.projection[:tokens],
             packed_kv.k_rope[:tokens],
@@ -130,12 +147,12 @@ def forward_expanded_prefill(backend, q, k, v, layer, forward_batch, *, packed_k
             key_cache,
             value_cache,
             packed_kv.nope_dim,
+            **dense_outputs,
         )
     metadata = backend.forward_metadata
-    if not any(forward_batch.extend_prefix_lens_cpu):
-        # The whole K/V sequence already exists as contiguous projection
-        # outputs. Keep caching it for future hits, but avoid paged-attention
-        # overhead when no history needs to be read.
+    if not has_prefix:
+        # No-prefix fusion emits the same contiguous K/V rows consumed by FIA
+        # while also caching them, avoiding the five separate layout kernels.
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query[:tokens],
             k[:tokens].reshape(tokens, geometry.heads, geometry.key_dim).contiguous(),
