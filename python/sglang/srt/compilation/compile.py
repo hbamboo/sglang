@@ -127,7 +127,7 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
 
 
 def _mark_dynamic_forward_batch(forward_batch) -> None:
-    """Mark runtime-sized ForwardBatch tensors before the first PCG trace.
+    """Soft-mark current ForwardBatch tensors before a compiled PCG invocation.
 
     ``ForwardBatch`` is deliberately not annotated as a Tensor, so the
     annotation-based argument inference above cannot see its tensor fields.
@@ -160,6 +160,7 @@ def install_torch_compiled(
     if not callable(unbound_fwd):
         raise TypeError("module.__class__.forward must be callable")
     original_code = unbound_fwd.__code__
+    forward_signature = inspect.signature(unbound_fwd)
 
     dyn_map = dynamic_arg_dims or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)
 
@@ -195,13 +196,9 @@ def install_torch_compiled(
 
     torch._dynamo.convert_frame.register_bytecode_hook(bytecode_hook)
 
-    def _ensure_compiled(self, *args, **kwargs):
-        """Compile on first use (with flag ON)."""
-        if state["compiled"]:
-            return
-        # Mark dynamic dims only when we are about to compile
-        sig = inspect.signature(unbound_fwd)
-        ba = sig.bind(self, *args, **kwargs)
+    def _mark_runtime_inputs(self, *args, **kwargs):
+        # Reapply the existing soft-mark policy to current serving tensors.
+        ba = forward_signature.bind(self, *args, **kwargs)
         ba.apply_defaults()
         for name, dims in (dyn_map or {}).items():
             if name in ba.arguments:
@@ -210,6 +207,10 @@ def install_torch_compiled(
                     _mark_dynamic_on_value(val, dims)
         _mark_dynamic_forward_batch(ba.arguments.get("forward_batch"))
 
+    def _ensure_compiled(self, *args, **kwargs):
+        """Compile on first use (with flag ON)."""
+        if state["compiled"]:
+            return
         # Avoid cross-instance cache reuse
         torch._dynamo.eval_frame.remove_from_cache(unbound_fwd.__code__)
 
@@ -229,6 +230,7 @@ def install_torch_compiled(
     def trampoline(self, *args, **kwargs):
         use_compiled = is_in_tc_piecewise_cuda_graph()
         if use_compiled:
+            _mark_runtime_inputs(self, *args, **kwargs)
             if not state["compiled"]:
                 _ensure_compiled(self, *args, **kwargs)
 
