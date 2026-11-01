@@ -149,19 +149,31 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
             if scale.dtype != torch.float8_e8m0fnu:
                 raise RuntimeError("Prequantized MoE routing requires E8M0 scale bytes")
             scale_args["scale"] = scale
-        hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
-                hidden_states,
-                topk_ids,
-                active_num=num_tokens * top_k,
-                expert_num=num_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
-                quant_mode=-1 if prequant else self.quant_mode,
-                **scale_args,
+        routed = None
+        if prequant and envs.SGLANG_NPU_MOE_STABLE_ROUTING.get():
+            from sglang.srt.hardware_backend.npu.moe.stable_routing import (
+                try_stable_prequantized_routing,
             )
-        )
+
+            routed = try_stable_prequantized_routing(
+                hidden_states, topk_ids, scale_args["scale"], num_experts, top_k
+            )
+        if routed is None:
+            hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+                torch.ops.npu.npu_moe_init_routing_v2(
+                    hidden_states,
+                    topk_ids,
+                    active_num=num_tokens * top_k,
+                    expert_num=num_experts,
+                    expert_tokens_num_type=1,
+                    expert_tokens_num_flag=True,
+                    active_expert_range=[0, num_experts],
+                    quant_mode=-1 if prequant else self.quant_mode,
+                    **scale_args,
+                )
+            )
+        else:
+            hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = routed
         if self.quant_mode == -1:
             pertoken_scale = None
         elif self.quant_mode == MXFP8_QUANT_MODE:

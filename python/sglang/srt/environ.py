@@ -762,6 +762,8 @@ class Envs:
     SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES = EnvBool(False)
     # Reuse existing MXFP8 once before top-k expansion on measured large PD prefill.
     SGLANG_NPU_MOE_PREQUANT_ROUTING = EnvBool(False)
+    # Stable byte routing for qualified eager PD prefill; optional kernel companion.
+    SGLANG_NPU_MOE_STABLE_ROUTING = EnvBool(False)
     # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
     # Set only on P. Zero preserves the existing capacity calculation.
     SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB = EnvInt(0)
