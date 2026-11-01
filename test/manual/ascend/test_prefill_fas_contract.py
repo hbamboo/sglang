@@ -57,6 +57,35 @@ class PrefillFASContractTests(unittest.TestCase):
             with self.subTest(q=q, prefix=prefix):
                 self.assertEqual(fas._shape_reason(q, prefix, tokens), reason)
 
+    def test_extended_shapes_measured_points_need_opt_in(self):
+        for q, prefix in [
+            ((2048, 4415), (256, 128)),
+            ((2048, 4415), (640, 640)),
+            ((2048,) * 3, (640,) * 3),
+            ((512, 1536, 4096), (640,) * 3),
+            ((2048,) * 12, (640,) * 12),
+            ((2048,) * 16, (640,) * 16),
+        ]:
+            with self.subTest(q=q):
+                self.assertNotEqual(fas._shape_reason(q, prefix, sum(q)), "eligible")
+                self.assertEqual(fas._shape_reason(q, prefix, sum(q), extended_shapes=True), "eligible")
+
+    def test_extended_shapes_keep_other_guard_boundaries(self):
+        cases = [
+            ((2048, 4095), (640,) * 2, "total_tokens"),
+            ((1536,) * 4, (640,) * 4, "mean_query_length"),
+            ((2048,) * 17, (640,) * 17, "batch_size"),
+            ((2048,) * 15 + (2049,), (640,) * 16, "total_tokens"),
+            ((511, 1537, 4096), (640,) * 3, "extend_length"),
+            ((6529, 2048), (640, 640), "extend_length"),
+            ((2048,) * 3, (641, 640, 640), "prefix_length"),
+            ((2048,) * 3, (0,) * 3, "fresh_unchanged"),
+            ((6144,), (640,), "batch_size"),
+        ]
+        for q, prefix, reason in cases:
+            with self.subTest(q=q, reason=reason):
+                self.assertEqual(fas._shape_reason(q, prefix, sum(q), extended_shapes=True), reason)
+
     @staticmethod
     def metadata():
         return SimpleNamespace(prefill_fas_decision=None, prefill_fas_staging=None)
@@ -178,6 +207,11 @@ class PrefillFASContractTests(unittest.TestCase):
         self.assertEqual(len(flags), 1)
         self.assertEqual(flags[0].value.func.id, "EnvBool")
         self.assertIs(flags[0].value.args[0].value, False)
+        extended = [n for n in ast.walk(environ) if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES" for t in n.targets)]
+        self.assertEqual(len(extended), 1)
+        self.assertEqual(extended[0].value.func.id, "EnvBool")
+        self.assertIs(extended[0].value.args[0].value, False)
         backend = ast.parse((ROOT / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py").read_text(encoding="utf-8"))
         metadata = next(n for n in backend.body if isinstance(n, ast.ClassDef) and n.name == "ForwardMetadata")
         fields = {n.target.id: n.value for n in metadata.body if isinstance(n, ast.AnnAssign)}

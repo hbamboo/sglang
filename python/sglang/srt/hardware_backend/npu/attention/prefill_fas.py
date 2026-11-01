@@ -40,7 +40,7 @@ def _cumulative(lengths):
     return tuple(result)
 
 
-def _shape_reason(q_lengths, prefixes, tokens):
+def _shape_reason(q_lengths, prefixes, tokens, *, extended_shapes=False):
     """Conservative initial subset; it is not the full business workload."""
     if len(q_lengths) != len(prefixes) or not q_lengths:
         return "length_metadata"
@@ -50,9 +50,9 @@ def _shape_reason(q_lengths, prefixes, tokens):
         return "length_metadata"
     if not any(prefixes):
         return "fresh_unchanged"
-    if not 2 <= len(q_lengths) <= 8:
+    if not 2 <= len(q_lengths) <= (16 if extended_shapes else 8):
         return "batch_size"
-    if not 8192 <= tokens <= 32768:
+    if not (6144 if extended_shapes else 8192) <= tokens <= 32768:
         return "total_tokens"
     if any(not 512 <= q <= 6528 for q in q_lengths):
         return "extend_length"
@@ -181,6 +181,8 @@ def maybe_forward_expanded_prefill_fas(backend, query, layer, forward_batch):
     pool = backend.token_to_kv_pool
 
     def decide():
+        from sglang.srt.environ import envs
+
         def fallback(reason):
             return PrefillFASDecision(owner=forward_batch, reason=reason)
 
@@ -205,7 +207,10 @@ def maybe_forward_expanded_prefill_fas(backend, query, layer, forward_batch):
             return fallback("geometry")
         q_lengths = tuple(int(v) for v in forward_batch.extend_seq_lens_cpu)
         prefixes = tuple(int(v) for v in forward_batch.extend_prefix_lens_cpu)
-        reason = _shape_reason(q_lengths, prefixes, forward_batch.num_token_non_padded_cpu)
+        reason = _shape_reason(
+            q_lengths, prefixes, forward_batch.num_token_non_padded_cpu,
+            extended_shapes=envs.SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES.get(),
+        )
         if reason != "eligible":
             return fallback(reason)
         kv_lengths = tuple(int(v) for v in backend._get_seq_lens_cpu_int_list())

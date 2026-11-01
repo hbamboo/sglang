@@ -759,6 +759,7 @@ class Envs:
     SGLANG_NPU_PREFILL_FUSED_KV_SCATTER = EnvBool(True)
     # Eager FAS candidate for guarded large expanded PD-prefill batches.
     SGLANG_NPU_PREFILL_FAS = EnvBool(False)
+    SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES = EnvBool(False)
     # Reuse existing MXFP8 once before top-k expansion on measured large PD prefill.
     SGLANG_NPU_MOE_PREQUANT_ROUTING = EnvBool(False)
     # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
