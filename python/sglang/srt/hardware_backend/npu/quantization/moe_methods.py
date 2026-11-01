@@ -37,8 +37,8 @@ def _require_e8m0_dtype():
     own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on A5) and reject the torch
     dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
     but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
-    as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
-    ``_get_float8_e8m0fnu_dtype`` reads it off torch.
+    as a fallback. Dense ``npu_quant_matmul`` Meta inference requires the same
+    torch_npu enum; ``_get_float8_e8m0fnu_dtype`` follows that convention too.
 
     The MXFP8 ops take the scale dtype explicitly; passing None silently changes
     how they interpret the scales, so a missing dtype must raise rather than

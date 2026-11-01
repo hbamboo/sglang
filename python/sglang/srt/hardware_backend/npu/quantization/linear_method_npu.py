@@ -23,9 +23,17 @@ MXFP4_BLOCK_SIZE = 32
 # by the runtime), so this module needs no top-level `import torch_npu` and stays
 # importable on CUDA/CPU/AMD/XPU CI.
 def _get_float8_e8m0fnu_dtype():
-    # Resolve lazily rather than as a module-level constant: this module is
-    # imported early (during quant-scheme registration), so reading the dtype at
-    # call time keeps it correct regardless of import order / platform.
+    # npu_quant_matmul's Meta kernel requires the torch_npu scalar-type enum,
+    # even though eager execution also accepts the native torch dtype. Resolve
+    # lazily to preserve importability before NPU initialization and on CPU/CUDA.
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        import torch_npu
+
+        npu_dtype = getattr(torch_npu, "float8_e8m0fnu", None)
+        if npu_dtype is not None:
+            return npu_dtype
     return getattr(torch, "float8_e8m0fnu", None)
 
 
@@ -35,8 +43,8 @@ def _get_float4_e2m1fn_x2_dtype():
     # npu_quant_matmul(x2_dtype=), npu_format_cast(input_dtype=) -- REJECT the
     # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
     # builds (it raises, or with None gives "output y must be same shape as input
-    # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
-    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
+    # x"), even though torch.float4_e2m1fn_x2 exists. E8M0 scale arguments also
+    # require the torch_npu enum during Meta inference (see above). Verified on A5 /
     # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
     # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
     #
