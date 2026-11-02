@@ -159,16 +159,15 @@ class TestNPUHiCacheExpandedTransfer(unittest.TestCase):
                     expected[target] = original[source]
                 return expected
 
-            # Read through the real layer-fenced compact getters before the
-            # overall completion wait. The same layer event must also cover
-            # expanded copies before their raw per-layer getter is consumed.
+            # Read expanded buffers first, before any compact getter or the
+            # overall completion wait can mask a missing expanded-layer fence.
             for local in range(layers):
                 global_layer = device.start_layer + local
+                expanded_key, expanded_value = device.get_prefill_expanded_kv(global_layer)
+                expanded_key, expanded_value = expanded_key.cpu(), expanded_value.cpu()
                 key = device.get_key_buffer(global_layer).cpu()
                 rope = device.get_value_buffer(global_layer).cpu()
                 index = device.get_index_k_buffer(global_layer).cpu()
-                expanded_key, expanded_value = device.get_prefill_expanded_kv(global_layer)
-                expanded_key, expanded_value = expanded_key.cpu(), expanded_value.cpu()
                 latent = originals["kv_buffer"][local] if unified else None
                 original_key = latent[..., :512] if unified else originals["k_buffer"][local]
                 original_rope = latent[..., 512:] if unified else originals["v_buffer"][local]

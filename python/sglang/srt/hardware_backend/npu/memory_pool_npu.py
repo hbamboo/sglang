@@ -682,6 +682,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_prefill_expanded_kv(self, layer_id):
         local_layer_id = layer_id - self.start_layer
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(local_layer_id)
         return self.prefill_k_buffer[local_layer_id], self.prefill_v_buffer[local_layer_id]
 
     def set_prefill_expanded_kv(self, layer_id, loc, key, value):
