@@ -5,6 +5,9 @@ import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.mha_rope_cache import (
+    get_mha_rope_cos_sin,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -89,10 +92,13 @@ def forward_mha_prepare_npu(
 
     if m.use_deepseek_yarn_rope:
         B, S = q.shape[0], 1
-        cos, sin = m.rotary_emb.get_cos_sin_cache(
+        cos, sin = get_mha_rope_cos_sin(
             # Input-norm fusion can pass (FP8 values, scales). The Q projection
             # still emits the original BF16 attention dtype, not FP8.
-            positions, q.dtype, offsets=None
+            m.rotary_emb,
+            positions,
+            q.dtype,
+            forward_batch,
         )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
