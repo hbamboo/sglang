@@ -24,6 +24,20 @@ The route is deliberately narrow and defaults off:
     (auto_functionalized/allocator behaviour there has not been profiled; the
     original route is kept so graph capture remains correct).
 
+The legacy path reached the cache through ``pool.get_kv_buffer``, which first
+performs ``layer_transfer_counter.wait_until(layer_id - start_layer)`` under
+HiCache/async layer transfer.  This helper reads ``pool.kv_buffer`` directly, so
+once every narrow gate has passed (and before dispatching the new op) it calls
+the same public ``pool.get_kv_buffer(layer_id)`` and discards the two returned
+split views.  That call preserves all of the getter's synchronization side
+effects (and the getter computes the start_layer offset once); returning two
+metadata views does not run any CANN contiguous copy.  The already-validated
+packed 576-wide layer view is what gets passed to the kernel, and its
+``data_ptr`` already contains the layer storage offset.  Unsupported paths
+return before this getter call, so the original route owns its wait exactly
+once.  If a pool has no public getter we fall back rather than bypass the
+transfer contract.
+
 Everything else returns ``None`` and the caller keeps the original route.
 """
 
@@ -187,6 +201,18 @@ def maybe_unified_kv_rmsnorm_rope_cache(
     eps = getattr(m.kv_a_layernorm, "variance_epsilon", None)
     if eps is None:
         return None
+
+    # Preserve the public getter's cross-layer transfer dependency (HiCache /
+    # async layer transfer) immediately before the direct write.  The old MHA
+    # path inherited this wait through get_kv_buffer; simply reading kv_buffer
+    # would bypass it.  The returned 512/64 views are metadata only and are
+    # intentionally discarded; no CANN contiguous/copy kernel is involved.
+    # Unsupported paths returned above, so fallback never waits twice and a
+    # pool without a transfer counter keeps its normal path.
+    get_kv_buffer = getattr(pool, "get_kv_buffer", None)
+    if get_kv_buffer is None:
+        return None
+    get_kv_buffer(m.layer_id)
 
     kv4 = latent_cache.unsqueeze(2)  # [T,1,1,576]; row stride is preserved
     index = out_cache_loc if out_cache_loc.dtype == torch.int64 else out_cache_loc.to(torch.int64)
