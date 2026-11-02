@@ -40,9 +40,10 @@ DEV = "npu:0"
 HEAD = 20
 DK, DV, DR = 192, 256, 64
 TOTAL = DK + DV
-TOKENS = [0, 1, 31, 127, 128, 129, 3787, 15148]
+TOKENS = [1, 31, 127, 128, 129, 3787, 15148]
 DTYPES = [torch.bfloat16, torch.float16]
 TOL = {torch.bfloat16: (0.5, 2e-2), torch.float16: (0.05, 1e-2)}
+FORMAL_TIMING = os.environ.get("SPLIT_KV_FORMAL_TIMING", "0") == "1"
 
 
 def setup_runtime():
@@ -53,9 +54,12 @@ def setup_runtime():
     fctx.get_token_to_kv_pool = lambda: T.DummyPool()
 
 
-def make_projection_fns(m, tokens, dtype):
+def make_projection_fns(m, tokens, dtype, kv_4d=False):
     x = T.npu_random((tokens, 512), dtype, 1000 + tokens)
     kv_a = T.actual_kv_a(m, x)
+    if kv_4d:
+        # The real Yarn fused norm/cache path returns [T,1,1,K].
+        kv_a = kv_a.view(tokens, 1, 1, -1)
     k_pe = T.npu_random((tokens, 1, DR), dtype, 2000 + tokens)
 
     def baseline():
@@ -294,16 +298,25 @@ def profile_ops(metrics):
 
     pathlib.Path(tu.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     results = {}
-    for tokens in (129, 3787):
+    tag = tu.RUN_TAG
+    # T15148 is the principal bs4 target; 4D is the real Yarn fusednorm/cache
+    # return rank, profiled separately from the 2D synthetic projection.
+    jobs = [(129, False), (3787, False), (15148, False), (15148, True)]
+    for tokens, kv_4d in jobs:
         m, x, pos, fb = T.build_case(torch.bfloat16, False, tokens)
         state, _ = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
         assert state is not None
-        base_fn, cand_fn, _, _ = make_projection_fns(m, tokens, torch.bfloat16)
+        base_fn, cand_fn, _, _ = make_projection_fns(
+            m, tokens, torch.bfloat16, kv_4d=kv_4d
+        )
+        kind = "4d" if kv_4d else "2d"
         for side, fn in (("baseline", base_fn), ("candidate", cand_fn)):
             for _ in range(5):
                 fn()
             torch.npu.synchronize()
-            trace = f"{tu.RESULTS_DIR}/profile_{side}_T{tokens}.json"
+            trace = (
+                f"{tu.RESULTS_DIR}/profile_{side}_T{tokens}_{kind}{tag}.json"
+            )
             with torch_npu.profiler.profile(
                 activities=[
                     torch_npu.profiler.ProfilerActivity.CPU,
@@ -319,13 +332,15 @@ def profile_ops(metrics):
                 events = events.get("traceEvents", [])
             summary = _prof_summary(events, tokens)
             summary["trace"] = trace
-            results[f"{side}_T{tokens}"] = summary
+            summary["kv_a_rank"] = 4 if kv_4d else 2
+            results[f"{side}_T{tokens}_{kind}"] = summary
             print(
                 "PROFILE",
                 json.dumps(
                     {
                         "side": side,
                         "T": tokens,
+                        "kind": kind,
                         "matmul": summary["matmul_kernels"],
                         "slice": summary["slice_kernels"],
                         "viewcopy": summary["viewcopy_kernels"],
@@ -348,7 +363,8 @@ def profile_ops(metrics):
                 assert summary["packed_source_slices"] == 0, summary
                 assert summary["viewcopy_kernels"] == 10, summary
                 assert summary["broadcast_kernels"] == 5, summary
-                # Only the remaining destination K_nope and RoPE writes.
+                # Only the remaining destination K_nope and RoPE writes; a 4D
+                # input must not add an input contiguity/packing kernel.
                 assert all(
                     dims.startswith(f"{tokens},20,192;") or dims.startswith(f"{tokens},20,64;")
                     for dims in summary["copy_inputs"]
@@ -358,9 +374,17 @@ def profile_ops(metrics):
 
 def main():
     setup_runtime()
+
     def run(metrics):
-        bench_matrix(metrics)
-        full_prepare_timing(metrics)
+        if FORMAL_TIMING:
+            bench_matrix(metrics)
+            full_prepare_timing(metrics)
+        else:
+            metrics["latency"] = []
+            metrics["full_prepare"] = []
+            metrics["formal_timing_skipped"] = (
+                "SPLIT_KV_FORMAL_TIMING!=1; coordinated PERF_GO window not open"
+            )
         static_preparation_cost(metrics)
         profile_ops(metrics)
 

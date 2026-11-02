@@ -160,6 +160,12 @@ def test_support_predicates():
     mod_bias = make_module(dtype=torch.bfloat16, bias=True)
     mod_bias.bias = mod_bias.bias[:-1]
     assert "bias numel" in skv.unsupported_reason(attn, mod_bias, check_device=False)
+    mod_hook = make_module(dtype=torch.bfloat16)
+    mod_hook.register_forward_hook(lambda *args: None)
+    assert skv.unsupported_reason(attn, mod_hook, check_device=False) == "forward hooks"
+    mod_lora = make_module(dtype=torch.bfloat16)
+    mod_lora.set_lora = True
+    assert "LoRA" in skv.unsupported_reason(attn, mod_lora, check_device=False)
     print("PASS support/fallback predicates")
 
 
@@ -174,7 +180,15 @@ def test_state_lifecycle_cpu():
         state, reason = skv.prepare_split_kv_b_proj(attn, mod, force=True)
         assert reason == "prepared" and state is not None
         state2, reason2 = skv.prepare_split_kv_b_proj(attn, mod, force=True)
-        assert reason2 == "already prepared" and state2 is state
+        # force always rebuilds: the real loader cannot rely on _version.
+        assert reason2 == "prepared" and state2 is not state
+        orig_enabled = skv.is_split_kv_b_proj_enabled
+        skv.is_split_kv_b_proj_enabled = lambda: True
+        try:
+            state_reuse, reason_reuse = skv.prepare_split_kv_b_proj(attn, mod)
+            assert reason_reuse == "already prepared" and state_reuse is state2
+        finally:
+            skv.is_split_kv_b_proj_enabled = orig_enabled
 
         x = torch.randn(7, 16)
         out = skv.maybe_forward_split_kv_b_proj(attn, mod, x, None)
@@ -183,7 +197,37 @@ def test_state_lifecycle_cpu():
         assert k_nope.shape == (7, 4, 8) and v.shape == (7, 4, 12)
         assert k_nope.is_contiguous() and v.is_contiguous()
 
-        # In-place weight reload bumps _version -> fall back, never stale.
+        # Actual ColumnParallelLinear.weight_loader writes through param.data;
+        # this does not bump Parameter._version, so only the loader's forced
+        # invalidation/rebuild can prevent stale split buffers.
+        version_before = mod.weight._version
+        new_weight = torch.randn_like(mod.weight)
+        with torch.no_grad():
+            mod.weight.data.copy_(new_weight)
+        assert mod.weight._version == version_before
+        exp_k, exp_v, _, _ = skv.split_kv_b_proj_weight(
+            new_weight, None, 4, 8, 12
+        )
+        state4, reason4 = skv.prepare_split_kv_b_proj(attn, mod, force=True)
+        assert reason4 == "prepared"
+        assert torch.equal(state4.w_k, exp_k) and torch.equal(state4.w_v, exp_v)
+        assert state4 is not state2
+        fresh = skv.maybe_forward_split_kv_b_proj(attn, mod, x, None)
+        assert fresh is not None
+        assert torch.allclose(
+            fresh[0].reshape(-1, 32),
+            torch.nn.functional.linear(x, exp_k),
+            rtol=0,
+            atol=1e-4,
+        )
+        assert torch.allclose(
+            fresh[1].reshape(-1, 48),
+            torch.nn.functional.linear(x, exp_v),
+            rtol=0,
+            atol=1e-4,
+        )
+
+        # In-place modification that bumps _version -> immediate fallback.
         with torch.no_grad():
             mod.weight.add_(1.0)
         assert skv.maybe_forward_split_kv_b_proj(attn, mod, x, None) is None

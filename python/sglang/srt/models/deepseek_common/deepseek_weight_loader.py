@@ -532,9 +532,11 @@ class DeepseekV2WeightLoaderMixin:
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
-        # Split KV-B weights are derived state.  Refresh only layers touched by
-        # this load and drop the rest when a partial reload named its weights,
-        # so a later forward cannot observe buffers derived from old weights.
+        # Split KV-B weights are derived state.  A real weight_loader writes
+        # through param.data.copy_, which does not bump Parameter._version, so
+        # every layer touched by this completed load is explicitly invalidated
+        # and rebuilt below.  Layers not named by a partial reload keep their
+        # current valid split; they were not modified by this load.
         split_enabled = False
         split_prepared = 0
         split_skipped = {}
@@ -546,17 +548,6 @@ class DeepseekV2WeightLoaderMixin:
             )
 
             split_enabled = is_split_kv_b_proj_enabled()
-            if split_enabled and weight_names is not None:
-                processed_layer_ids = set(layer_ids)
-                for layer_id in range(
-                    self.model.start_layer, self.model.end_layer
-                ):
-                    if layer_id in processed_layer_ids:
-                        continue
-                    stale_attn = self.model.layers[layer_id].self_attn
-                    invalidate_split_kv_b_proj(
-                        getattr(stale_attn, "kv_b_proj", None)
-                    )
 
         for layer_id in layer_ids:
             self_attn = (
@@ -768,9 +759,10 @@ class DeepseekV2WeightLoaderMixin:
 
             if split_enabled:
                 kv_b_proj = getattr(self_attn, "kv_b_proj", None)
+                invalidate_split_kv_b_proj(kv_b_proj)
                 try:
                     _, split_reason = prepare_split_kv_b_proj(
-                        self_attn, kv_b_proj
+                        self_attn, kv_b_proj, force=True
                     )
                 except Exception:
                     # A derived optimization must never break model loading.

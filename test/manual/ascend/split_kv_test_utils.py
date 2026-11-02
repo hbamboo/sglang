@@ -18,6 +18,7 @@ FRAMEWORK = "/mnt/sfs_turbo/hxd/split-kv-matmul-20261102/framework"
 RESULTS_DIR = os.environ.get(
     "SPLIT_KV_RESULTS_DIR", "/mnt/sfs_turbo/hxd/split-kv-matmul-20261102/results"
 )
+RUN_TAG = os.environ.get("SPLIT_KV_RUN_TAG", "")
 
 
 def assert_npu5_idle() -> str:
@@ -97,6 +98,7 @@ def collect_context() -> dict:
 def record_result(name: str, status: str, metrics: dict, error: str = None) -> str:
     payload = {
         "name": name,
+        "run_tag": RUN_TAG,
         "status": status,
         "exit_code": 0 if status == "PASS" else 1,
         "context": collect_context(),
@@ -106,7 +108,7 @@ def record_result(name: str, status: str, metrics: dict, error: str = None) -> s
         payload["error"] = error
     out = pathlib.Path(RESULTS_DIR)
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{name}.json"
+    path = out / f"{name}{RUN_TAG}.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"RESULT_JSON {path}")
     print(json.dumps({"name": name, "status": status, "error": error}))

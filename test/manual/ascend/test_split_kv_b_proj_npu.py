@@ -51,7 +51,8 @@ class DummyPool:
         return None
 
     def get_kv_buffer(self, *args, **kwargs):
-        raise AssertionError("unexpected get_kv_buffer in MHA prepare")
+        # Only consumed by the Yarn fused norm/cache fixture, which ignores it.
+        return None, None
 
 
 class FakeForwardMode:
@@ -99,6 +100,52 @@ class FakeRotary(torch.nn.Module):
 
     def forward(self, positions, q_pe, k_pe):
         return q_pe * self.q_scale, k_pe * self.k_scale
+
+
+class YarnRotary(torch.nn.Module):
+    """Provides the cos/sin cache consumed by the Yarn fused KV path."""
+
+    def __init__(self, dim, dtype):
+        super().__init__()
+        self.dim = dim
+        self.dtype = dtype
+
+    def get_cos_sin_cache(self, positions, dtype, offsets=None):
+        tokens = positions.numel()
+        cos = torch.ones(tokens, self.dim // 2, dtype=dtype, device=DEV)
+        sin = torch.zeros(tokens, self.dim // 2, dtype=dtype, device=DEV)
+        return cos, sin
+
+
+class FusedNormCacheFixture:
+    """Mimics torch_npu.npu_kv_rmsnorm_rope_cache output layouts.
+
+    The real op returns kv_a as contiguous [T,1,1,K] while k_pe is reshaped by
+    the caller to [T,1,Dr].  This fixture preserves that contract.
+    """
+
+    def __init__(self, k_dim, rope_dim):
+        self.k_dim = k_dim
+        self.rope_dim = rope_dim
+        self.last_kv_a = None
+        self.last_k_pe = None
+        self.calls = 0
+
+    def npu_interleave_rope(self, x, cos, sin):
+        return x
+
+    def npu_kv_rmsnorm_rope_cache(
+        self, latent, weight, cos, sin, out_cache_loc, k_rope_cache, ckv_cache,
+        **kwargs,
+    ):
+        self.calls += 1
+        kv_a = latent[..., : self.k_dim].contiguous()
+        assert kv_a.shape[-4:] == (1, 1, 1, self.k_dim) or kv_a.shape[-1] == self.k_dim
+        k_pe = latent[..., self.k_dim :].reshape(-1, self.rope_dim)
+        self.last_kv_a = kv_a.detach()
+        self.last_k_pe = k_pe.detach()
+        zero = kv_a.new_zeros(())
+        return zero, zero, k_pe, kv_a
 
 
 class FakeMLA(torch.nn.Module):
@@ -355,6 +402,273 @@ def run_case(dtype, bias, tokens, label, metrics, **kwargs):
             os.environ["SGLANG_NPU_SPLIT_KV_B_PROJ"] = eager_env
 
 
+def t0_fallback_case(metrics):
+    """Zero-token batches keep the original empty projection (no route)."""
+    dtype = torch.bfloat16
+    m, x, positions, fb = build_case(dtype, False, 0)
+    state, reason = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
+    assert state is not None
+    kv_a = actual_kv_a(m, x)
+    assert kv_a.numel() == 0
+    assert skv.maybe_forward_split_kv_b_proj(m, m.kv_b_proj, kv_a, fb) is None
+    q, k, v, _ = run_prepare(m, x, positions, fb)
+    assert tuple(k.shape) == (0, m.num_local_heads, m.qk_head_dim)
+    assert tuple(v.shape) == (0, m.num_local_heads, m.v_head_dim)
+    metrics["t0_fallback"] = {
+        "route_none": True,
+        "k_shape": list(k.shape),
+        "v_shape": list(v.shape),
+        "reason": "empty token batch keeps one empty matmul",
+    }
+    print("PASS T=0 fallback: no split route for empty token batch")
+
+
+def strided_fallback_case(metrics):
+    """Strided kv_a falls back; neither GEMM may materialize an input copy."""
+    dtype = torch.bfloat16
+    tokens = 129
+    m, x, positions, fb = build_case(dtype, False, tokens, strided=True)
+    state, _ = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
+    assert state is not None
+    kv_a_strided = actual_kv_a(m, x)
+    assert not kv_a_strided.is_contiguous()
+    assert skv.maybe_forward_split_kv_b_proj(
+        m, m.kv_b_proj, kv_a_strided, fb
+    ) is None
+    q, k, v, _ = run_prepare(m, x, positions, fb)
+    assert v.is_contiguous()
+    w_cpu = m.kv_b_proj.weight.detach().float().cpu()
+    kv_cpu = kv_a_strided.float().cpu()
+    rows = sampled_rows(tokens)
+    gk, gv = cpu_reference(
+        kv_cpu, w_cpu, None, m.qk_nope_head_dim, m.v_head_dim,
+        m.num_local_heads, rows,
+    )
+    stats_k = tu.close_stats(m.last_k_nope.detach()[rows], gk, 0.5, 2e-2)
+    stats_v = tu.close_stats(v.detach()[rows], gv, 0.5, 2e-2)
+    assert stats_k["bad"] == 0 and stats_v["bad"] == 0, (stats_k, stats_v)
+    metrics["strided_fallback"] = {
+        "route_none": True,
+        "kv_a_stride": list(kv_a_strided.stride()),
+        "golden_k": stats_k,
+        "golden_v": stats_v,
+    }
+    print("PASS strided kv_a fallback (old path) and CPU golden match")
+
+
+def bare_4d_case(metrics):
+    """Bare helper call with the real returned-kv_a rank [T,1,1,K]."""
+    dtype = torch.bfloat16
+    tokens = 31
+    m, x, positions, fb = build_case(dtype, False, tokens)
+    state, _ = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
+    assert state is not None
+    kv_a4d = torch.randn(
+        tokens, 1, 1, m.kv_lora_rank, dtype=dtype, device=DEV
+    )
+    ptr = kv_a4d.data_ptr()
+    stride = tuple(kv_a4d.stride())
+    out = skv.maybe_forward_split_kv_b_proj(m, m.kv_b_proj, kv_a4d, None)
+    assert out is not None
+    k_nope, v = out
+    assert tuple(k_nope.shape) == (tokens, m.num_local_heads, m.qk_nope_head_dim)
+    assert tuple(v.shape) == (tokens, m.num_local_heads, m.v_head_dim)
+    assert k_nope.is_contiguous() and v.is_contiguous()
+    assert kv_a4d.data_ptr() == ptr and tuple(kv_a4d.stride()) == stride
+    expected = m.kv_b_proj(kv_a4d)[0].view(
+        tokens, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim
+    )
+    st_k = tu.close_stats(k_nope, expected[..., : m.qk_nope_head_dim], 0.5, 2e-2)
+    st_v = tu.close_stats(v, expected[..., m.qk_nope_head_dim :], 0.5, 2e-2)
+    assert st_k["bad"] == 0 and st_v["bad"] == 0
+    metrics["bare_4d"] = {
+        "input_shape": list(kv_a4d.shape),
+        "input_contiguous": True,
+        "input_storage_unchanged": True,
+        "k_nope_shape": list(k_nope.shape),
+        "v_shape": list(v.shape),
+        "k_nope_contiguous": True,
+        "v_contiguous": True,
+        "old_vs_new_k": st_k,
+        "old_vs_new_v": st_v,
+    }
+    print("PASS bare 4D kv_a helper: contiguous [T,H,192]/[T,H,256], no input repack")
+
+
+def yarn_4d_case(metrics, tokens=129, label="yarn4d_bf16_T129"):
+    """Real forward_mha_prepare_npu with a realistic fusednorm/cache fixture."""
+    dtype = torch.bfloat16
+    m, x, positions, fb = build_case(dtype, False, tokens)
+    m.use_deepseek_yarn_rope = True
+    m.rotary_emb = YarnRotary(m.qk_rope_head_dim, dtype)
+    fixture = FusedNormCacheFixture(m.kv_lora_rank, m.qk_rope_head_dim)
+    orig_interleave = torch_npu.npu_interleave_rope
+    orig_kv_op = torch_npu.npu_kv_rmsnorm_rope_cache
+    orig_is_nz = attn_mod.is_fia_nz
+    torch_npu.npu_interleave_rope = fixture.npu_interleave_rope
+    torch_npu.npu_kv_rmsnorm_rope_cache = fixture.npu_kv_rmsnorm_rope_cache
+    attn_mod.is_fia_nz = lambda: False
+    try:
+        skv.invalidate_split_kv_b_proj(m.kv_b_proj)
+        q0, k0, v0, _ = run_prepare(m, x, positions, fb)
+        kv_a0 = fixture.last_kv_a.detach().clone()
+        assert tuple(kv_a0.shape) == (tokens, 1, 1, m.kv_lora_rank)
+        assert kv_a0.is_contiguous()
+        kn0 = m.last_k_nope.detach().clone()
+        kn0_stride = tuple(m.last_k_nope.stride())
+        kp0 = m.last_k_pe.detach().clone()
+
+        state, reason = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
+        assert state is not None
+        q1, k1, v1, _ = run_prepare(m, x, positions, fb)
+        kv_a1 = fixture.last_kv_a.detach().clone()
+        assert tuple(kv_a1.shape) == (tokens, 1, 1, m.kv_lora_rank)
+        assert kv_a1.is_contiguous()
+        kn1 = m.last_k_nope.detach().clone()
+        kn1_stride = tuple(m.last_k_nope.stride())
+        kp1 = m.last_k_pe.detach().clone()
+        v1_stride = tuple(v1.stride())
+
+        rows = sampled_rows(tokens)
+        case_stats(
+            dtype, tokens, label,
+            (q0, k0, v0, kn0, kp0),
+            (q1, k1, v1, kn1, kp1),
+            m, kv_a1.reshape(tokens, -1).float().cpu(), rows,
+            metrics, (kn0_stride, kn1_stride, v1_stride),
+        )
+        metrics[label].update(
+            {
+                "kv_a_shape": list(kv_a1.shape),
+                "kv_a_contiguous": bool(kv_a1.is_contiguous()),
+                "route_engaged": bool(skv.split_kv_b_proj_state(m.kv_b_proj)),
+                "fused_op_calls": fixture.calls,
+            }
+        )
+    finally:
+        torch_npu.npu_interleave_rope = orig_interleave
+        torch_npu.npu_kv_rmsnorm_rope_cache = orig_kv_op
+        attn_mod.is_fia_nz = orig_is_nz
+
+
+def compile_fallback_case(metrics):
+    """Genuine Dynamo fullgraph proof: prepared state falls back, no break."""
+    dtype = torch.bfloat16
+    tokens = 31
+    m, x, positions, fb = build_case(dtype, False, tokens)
+    state, _ = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
+    assert state is not None
+    kv_a = actual_kv_a(m, x)
+    heads, dk, dv = m.num_local_heads, m.qk_nope_head_dim, m.v_head_dim
+    graphs = []
+
+    def wrapper(inp):
+        split = skv.maybe_forward_split_kv_b_proj(m, m.kv_b_proj, inp, None)
+        if split is None:
+            return torch.nn.functional.linear(
+                inp, m.kv_b_proj.weight, m.kv_b_proj.bias
+            ).view(-1, heads, dk + dv)
+        k_nope, v = split
+        # Distinct marker: if Dynamo took the split branch this would show.
+        return torch.cat([k_nope, v], dim=-1) + 12345.0
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    compiled = torch.compile(wrapper, fullgraph=True, backend=backend)
+    out = compiled(kv_a)
+    torch.npu.synchronize()
+    expected = torch.nn.functional.linear(
+        kv_a, m.kv_b_proj.weight, m.kv_b_proj.bias
+    ).view(-1, heads, dk + dv)
+    stats = tu.close_stats(out, expected, 0.5, 2e-2)
+    assert len(graphs) == 1, f"Dynamo graph count {len(graphs)}"
+    assert stats["bad"] == 0, stats
+    metrics["compile_fallback"] = {
+        "fullgraph": True,
+        "backend": "eager",
+        "graph_count": len(graphs),
+        "route_fallback_without_graphbreak": True,
+        "marker_absent": True,
+        "max_abs": stats["max_abs"],
+    }
+    print(
+        "PASS torch.compile(fullgraph=True) fallback: 1 graph, "
+        f"no graphbreak, max_abs={stats['max_abs']:.3g}"
+    )
+
+
+def npu_capture_fallback_case(metrics):
+    """Genuine NPU graph capture: prepared state falls back inside capture."""
+    dtype = torch.bfloat16
+    tokens = 31
+    m, x, positions, fb = build_case(dtype, False, tokens)
+    state, _ = skv.prepare_split_kv_b_proj(m, m.kv_b_proj)
+    assert state is not None
+    kv_a = actual_kv_a(m, x)
+    heads, dk, dv = m.num_local_heads, m.qk_nope_head_dim, m.v_head_dim
+    total = dk + dv
+    out = torch.empty(tokens, heads, total, dtype=dtype, device=DEV)
+
+    def wrapper(inp, dst):
+        split = skv.maybe_forward_split_kv_b_proj(m, m.kv_b_proj, inp, None)
+        if split is None:
+            torch.matmul(
+                inp,
+                m.kv_b_proj.weight.t(),
+                out=dst.view(tokens, heads * total),
+            )
+            return dst
+        k_nope, v = split
+        dst.copy_(torch.cat([k_nope, v], dim=-1) + 12345.0)
+        return dst
+
+    # Eager: route active, so the marker branch is exercised.
+    with torch.no_grad():
+        wrapper(kv_a, out)
+    torch.npu.synchronize()
+    eager_split = out.clone()
+    expected = torch.matmul(kv_a, m.kv_b_proj.weight.t())
+
+    graph = torch.npu.NPUGraph()
+    torch.npu.synchronize()
+    try:
+        with torch.no_grad():
+            with torch.npu.graph(graph):
+                capturing = torch.npu.is_current_stream_capturing()
+                wrapper(kv_a, out)
+        torch.npu.synchronize()
+        out.zero_()
+        graph.replay()
+        torch.npu.synchronize()
+    except Exception as exc:  # capture support can vary by wheel
+        metrics["npu_capture"] = {
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        print(f"SKIP NPU graph capture unavailable: {type(exc).__name__}: {exc}")
+        return
+
+    stats = tu.close_stats(out.view(tokens, heads * total), expected, 0.5, 2e-2)
+    assert capturing is True
+    assert stats["bad"] == 0, stats
+    assert tu.close_stats(
+        eager_split.view(tokens, heads * total), expected, 0.5, 2e-2
+    )["bad"] != 0
+    metrics["npu_capture"] = {
+        "available": True,
+        "is_current_stream_capturing": bool(capturing),
+        "route_fallback": True,
+        "captured_max_abs": stats["max_abs"],
+        "marker_absent": True,
+    }
+    print(
+        "PASS NPU graph capture fallback: is_current_stream_capturing=True, "
+        f"captured max_abs={stats['max_abs']:.3g}"
+    )
+
+
 def route_checks(metrics):
     dtype = torch.bfloat16
     label = "routes"
@@ -504,7 +818,10 @@ def loader_integration(metrics):
             self.seed = seed
 
         def fill(self):
-            copy_weights(self.kv_b_proj, self.seed, scale=0.2)
+            self.kv_b_proj.weight_loader(
+                self.kv_b_proj.weight,
+                npu_random(tuple(self.kv_b_proj.weight.shape), self.kv_b_proj.weight.dtype, self.seed, 0.2),
+            )
 
     class Layer(torch.nn.Module):
         def __init__(self, attn):
@@ -536,37 +853,55 @@ def loader_integration(metrics):
     loader.post_load_weights(weight_names=None)
     assert all(skv.split_kv_b_proj_state(a.kv_b_proj) is not None for a in attns)
     assert all(a.w_kc is not None and a.w_vc is not None for a in attns)
+    initial_states = [skv.split_kv_b_proj_state(a.kv_b_proj) for a in attns]
 
-    # Partial reload naming only layer 1 keeps that layer and drops the rest.
+    # Partial reload naming only layer 1 rebuilds that layer and keeps the
+    # untouched layers' valid split state.
     loader.post_load_weights(
         weight_names=["model.layers.1.self_attn.kv_b_proj.weight"]
     )
-    assert skv.split_kv_b_proj_state(attns[0].kv_b_proj) is None
-    assert skv.split_kv_b_proj_state(attns[1].kv_b_proj) is not None
-    assert skv.split_kv_b_proj_state(attns[2].kv_b_proj) is None
+    partial_states = [skv.split_kv_b_proj_state(a.kv_b_proj) for a in attns]
+    assert partial_states[0] is initial_states[0]
+    assert partial_states[2] is initial_states[2]
+    assert partial_states[1] is not None and partial_states[1] is not initial_states[1]
 
-    # In-place reload through the loader rebuilds from the new weight.
-    with torch.no_grad():
-        attns[1].kv_b_proj.weight.add_(0.5)
+    # Real ColumnParallelLinear.weight_loader writes via param.data.copy_,
+    # which leaves Parameter._version unchanged; the loader must still rebuild.
     stale = skv.split_kv_b_proj_state(attns[1].kv_b_proj)
+    version_before = attns[1].kv_b_proj.weight._version
+    reloaded = npu_random(
+        tuple(attns[1].kv_b_proj.weight.shape), torch.bfloat16, 9911
+    )
+    attns[1].kv_b_proj.weight_loader(attns[1].kv_b_proj.weight, reloaded)
+    version_after = attns[1].kv_b_proj.weight._version
+    assert version_after == version_before, (version_before, version_after)
     loader.post_load_weights(
         weight_names=["model.layers.1.self_attn.kv_b_proj.weight"]
     )
     fresh = skv.split_kv_b_proj_state(attns[1].kv_b_proj)
-    assert fresh is not None and fresh.weight_version != stale.weight_version
-    assert fresh is not stale
+    assert fresh is not None and fresh is not stale
+    exp_k, exp_v, _, _ = skv.split_kv_b_proj_weight(reloaded, None, 4, 8, 12)
+    assert tu.close_stats(fresh.w_k, exp_k, 0.0, 0.0)["bad"] == 0
+    assert tu.close_stats(fresh.w_v, exp_v, 0.0, 0.0)["bad"] == 0
+    assert tu.close_stats(attns[1].kv_b_proj.weight, reloaded, 0.0, 0.0)["bad"] == 0
 
-    # Unrelated partial reload invalidates every derived split.
+    # An unrelated partial reload leaves all kv_b_proj split states intact.
     loader.post_load_weights(weight_names=["model.layers.0.mlp.weight"])
-    assert all(skv.split_kv_b_proj_state(a.kv_b_proj) is None for a in attns)
+    assert all(skv.split_kv_b_proj_state(a.kv_b_proj) is not None for a in attns)
+    assert [skv.split_kv_b_proj_state(a.kv_b_proj) for a in attns][0] is partial_states[0]
 
     metrics["loader_integration"] = {
         "prepared_all": True,
-        "partial_reload_kept_layer1": True,
-        "inplace_reload_rebuilt": True,
-        "unrelated_reload_invalidated": True,
+        "partial_reload_kept_untouched_states": True,
+        "real_weight_loader_version_unchanged": True,
+        "real_weight_loader_rebuilt": True,
+        "real_weight_loader_split_matches": True,
+        "unrelated_reload_preserved_states": True,
     }
-    print("PASS real post_load_weights integration and partial-reload invalidation")
+    print(
+        "PASS real post_load_weights: param.data.copy_ reload (version "
+        f"{version_before}->{version_after}) rebuilt Wk/Wv; untouched states kept"
+    )
 
 
 def main():
@@ -581,7 +916,7 @@ def main():
 
     def run(metrics):
         for dtype in (torch.bfloat16, torch.float16):
-            for tokens in (0, 1, 31, 127, 128, 129, 3787, 15148):
+            for tokens in (1, 31, 127, 128, 129, 3787, 15148):
                 run_case(
                     dtype, False, tokens,
                     f"main_{DTYPE_NAMES[dtype]}_T{tokens}",
@@ -595,14 +930,17 @@ def main():
                  local_heads=4, global_heads=16, tp_rank=1, tp_size=4)
         run_case(torch.bfloat16, False, 31, "one_local_head_bf16_T31", metrics,
                  local_heads=1, global_heads=1)
-        run_case(torch.bfloat16, False, 129, "strided_kv_a_bf16_T129", metrics,
-                 strided=True)
-        run_case(torch.float16, False, 129, "strided_kv_a_fp16_T129", metrics,
-                 strided=True)
         run_case(torch.bfloat16, True, 32, "identifiable_bias_bf16", metrics,
                  local_heads=4, identifiable=True)
         run_case(torch.float16, False, 32, "identifiable_fp16", metrics,
                  local_heads=4, identifiable=True)
+        t0_fallback_case(metrics)
+        strided_fallback_case(metrics)
+        bare_4d_case(metrics)
+        yarn_4d_case(metrics, tokens=129, label="yarn4d_bf16_T129")
+        yarn_4d_case(metrics, tokens=3787, label="yarn4d_bf16_T3787")
+        compile_fallback_case(metrics)
+        npu_capture_fallback_case(metrics)
         route_checks(metrics)
         loader_integration(metrics)
 

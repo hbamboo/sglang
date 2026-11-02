@@ -160,6 +160,20 @@ def unsupported_reason(
         return "gather_output=True"
     if getattr(module, "skip_bias_add", False):
         return "skip_bias_add=True"
+    # Do not bypass wrappers/LoRA or user hooks that may change the projection.
+    if "forward" in vars(module):
+        return "instance forward override"
+    if getattr(module, "_forward_hooks", None) or getattr(
+        module, "_forward_pre_hooks", None
+    ):
+        return "forward hooks"
+    if (
+        getattr(module, "set_lora", False)
+        or hasattr(module, "lora_backend")
+        or hasattr(module, "A_buffer")
+        or hasattr(module, "B_buffer")
+    ):
+        return "LoRA/adapter module"
     if getattr(attn, "use_dsa", False):
         return "DSA"
 
@@ -271,14 +285,19 @@ def prepare_split_kv_b_proj(
 ) -> Tuple[Optional[SplitKVBProjState], str]:
     """Prepare (or refresh) the split buffers for one attention module.
 
-    ``force`` is for tests only.  Production callers use the env gate.
+    ``force=True`` bypasses the env gate and the reuse fast-path; the real
+    loader uses it after invalidating a layer at the end of every completed
+    weight load.  ``param.data.copy_`` in ``ColumnParallelLinear.weight_loader``
+    does not bump ``Parameter._version``, so the loader must not rely on the
+    metadata guard to detect a reload.
     """
     if not force and not is_split_kv_b_proj_enabled():
         return None, "env disabled"
 
     existing = getattr(module, _STATE_ATTR, None) if module is not None else None
     if (
-        existing is not None
+        not force
+        and existing is not None
         and _state_is_current(existing, module)
         and _state_matches_attn(existing, attn)
     ):
@@ -397,23 +416,30 @@ def maybe_forward_split_kv_b_proj(
     state = getattr(module, _STATE_ATTR, None) if module is not None else None
     if state is None:
         return None
+    # Dynamo/capture must be rejected before touching data_ptr/_version, which
+    # are not traceable and would otherwise graph-break before the fallback.
+    if _capture_or_compile_active():
+        return None
+    # Empty batches have nothing to save; keep the single empty matmul.
+    if not isinstance(kv_a, torch.Tensor) or kv_a.numel() == 0:
+        return None
     if not _state_is_current(state, module):
         return None
     if not _state_matches_attn(state, attn):
         return None
     if getattr(attn, "use_dsa", False):
         return None
-    if _capture_or_compile_active():
-        return None
     if _sp_active_needs_old_path(module, state):
         return None
     if _expanded_kv_may_fuse(forward_batch):
         return None
-    if not isinstance(kv_a, torch.Tensor):
-        return None
     if kv_a.dim() < 1 or kv_a.shape[-1] != state.input_size:
         return None
     if kv_a.dtype != state.weight_dtype or kv_a.device != state.weight_device:
+        return None
+    # A strided kv_a would make both GEMMs materialize an input copy; keep the
+    # original single projection on that unverified shape.
+    if not kv_a.is_contiguous():
         return None
 
     k_nope = torch.nn.functional.linear(kv_a, state.w_k, state.b_k)
