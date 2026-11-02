@@ -111,9 +111,13 @@ class HelperContractTest(unittest.TestCase):
         self._old_op = qlm._fused_rmsnorm_mxquant_op
         self._old_compile = qlm._compiler_is_compiling
         self._old_capture = qlm._device_is_capturing
+        self._old_input_is_npu = qlm._input_is_npu
         qlm._FUSION_ENABLED = True
         qlm._compiler_is_compiling = lambda: False
         qlm._device_is_capturing = lambda: False
+        # Behavioral mocks run on CPU tensors; the isolated device predicate is
+        # patched here.  The CPU/meta proof tests restore the real predicate.
+        qlm._input_is_npu = lambda x: True
         self.op = FakeFusedOp()
         qlm._fused_rmsnorm_mxquant_op = lambda: self.op
 
@@ -122,6 +126,7 @@ class HelperContractTest(unittest.TestCase):
         qlm._fused_rmsnorm_mxquant_op = self._old_op
         qlm._compiler_is_compiling = self._old_compile
         qlm._device_is_capturing = self._old_capture
+        qlm._input_is_npu = self._old_input_is_npu
 
     def call(self, norm=None, proj=None, x=None, **kwargs):
         norm = norm if norm is not None else FakeNorm()
@@ -172,6 +177,101 @@ class HelperContractTest(unittest.TestCase):
         )
         self.assertIsNone(out)
         self.assertEqual(self.op.calls, [])
+
+    def test_compile_guard_failure_fails_closed(self):
+        capture_calls = []
+        norm, proj = make_fakes()
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+
+        def broken_compile():
+            raise RuntimeError("compile probe failed")
+
+        out = self.call(
+            norm=norm,
+            proj=proj,
+            x=x,
+            is_compiling=broken_compile,
+            is_capturing=lambda: capture_calls.append(1) or False,
+        )
+        self.assertIsNone(out)
+        self.assertEqual(capture_calls, [])
+        self.assertEqual(self.op.calls, [])
+        self.assertEqual(proj.quant_method.calls, [])
+
+    def test_capture_guard_failure_fails_closed(self):
+        norm, proj = make_fakes()
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+
+        def broken_capture():
+            raise RuntimeError("capture probe failed")
+
+        out = self.call(
+            norm=norm,
+            proj=proj,
+            x=x,
+            is_compiling=lambda: False,
+            is_capturing=broken_capture,
+        )
+        self.assertIsNone(out)
+        self.assertEqual(self.op.calls, [])
+        self.assertEqual(proj.quant_method.calls, [])
+
+    def test_cpu_and_meta_input_never_query_capture_or_fused(self):
+        # Restore the real predicate: CPU/meta must fall back at the device
+        # check before the capture probe or the fused kernel can be reached.
+        qlm._input_is_npu = self._old_input_is_npu
+
+        def forbid(name):
+            def raise_it(*args, **kwargs):
+                raise AssertionError(f"{name} must not be reached for CPU/meta")
+
+            return raise_it
+
+        qlm._device_is_capturing = forbid("capture probe")
+        qlm._fused_rmsnorm_mxquant_op = forbid("fused op")
+        norm, proj = make_fakes()
+        for x in (
+            torch.zeros((4, 768), dtype=torch.bfloat16),
+            torch.empty((4, 768), dtype=torch.bfloat16, device="meta"),
+        ):
+            with self.subTest(device=x.device.type):
+                self.assertIsNone(
+                    qlm.forward_q_latent_rmsnorm_mxquant(norm, proj, x)
+                )
+                self.assertEqual(
+                    qlm.fusion_blocker(norm, proj, x),
+                    "input_not_npu",
+                )
+
+    def test_operator_device_mismatch_falls_back(self):
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+        norm, proj = make_fakes()
+        norm.weight = SimpleNamespace(
+            dtype=torch.bfloat16,
+            device=SimpleNamespace(type="cpu", index=1),
+        )
+        self.assertEqual(
+            qlm.fusion_blocker(norm, proj, x), "norm_device_mismatch"
+        )
+
+        norm, proj = make_fakes()
+        proj.weight = SimpleNamespace(
+            dtype=torch.float8_e4m3fn,
+            device=SimpleNamespace(type="cpu", index=1),
+            dim=lambda: 2,
+            shape=(768, 68),
+        )
+        self.assertEqual(
+            qlm.fusion_blocker(norm, proj, x), "proj_device_mismatch"
+        )
+
+    def test_same_device_predicate(self):
+        cpu0 = SimpleNamespace(type="cpu", index=0)
+        cpu1 = SimpleNamespace(type="cpu", index=1)
+        npu0 = SimpleNamespace(type="npu", index=0)
+        self.assertTrue(qlm._same_device(cpu0, cpu0))
+        self.assertFalse(qlm._same_device(cpu0, cpu1))
+        self.assertFalse(qlm._same_device(cpu0, npu0))
 
     def test_unsupported_routes_fall_back(self):
         x2d = torch.zeros((4, 768), dtype=torch.bfloat16)
@@ -421,10 +521,14 @@ class PrepareRouteContractTest(unittest.TestCase):
             "op": qlm._fused_rmsnorm_mxquant_op,
             "compile": qlm._compiler_is_compiling,
             "capture": qlm._device_is_capturing,
+            "input_is_npu": qlm._input_is_npu,
         }
         qlm._FUSION_ENABLED = True
         qlm._compiler_is_compiling = lambda: False
         qlm._device_is_capturing = lambda: False
+        # CPU route mocks behave as NPU tensors; the dedicated proof test
+        # restores the real predicate.
+        qlm._input_is_npu = lambda x: True
         self.op = FakeFusedOp()
         qlm._fused_rmsnorm_mxquant_op = lambda: self.op
         mha._use_ag_after_qlora = False
@@ -441,6 +545,7 @@ class PrepareRouteContractTest(unittest.TestCase):
         qlm._fused_rmsnorm_mxquant_op = self._old_qlm["op"]
         qlm._compiler_is_compiling = self._old_qlm["compile"]
         qlm._device_is_capturing = self._old_qlm["capture"]
+        qlm._input_is_npu = self._old_qlm["input_is_npu"]
 
     def fixture(
         self,
@@ -642,6 +747,31 @@ class PrepareRouteContractTest(unittest.TestCase):
         self.run_prepare(q_lora_rank=512)
         self.assertEqual(self.op.calls, [])
         self.assertEqual(self.norm.call_count, 1)
+
+
+    def test_cpu_input_never_queries_capture_or_fused_in_real_route(self):
+        self.fixture()
+        qlm._input_is_npu = self._old_qlm["input_is_npu"]
+
+        def forbid(name):
+            def raise_it(*args, **kwargs):
+                raise AssertionError(f"{name} must not be reached for CPU input")
+
+            return raise_it
+
+        qlm._device_is_capturing = forbid("capture probe")
+        qlm._fused_rmsnorm_mxquant_op = forbid("fused op")
+        mha.forward_mha_prepare_npu(
+            self.m,
+            torch.arange(self.rows),
+            torch.zeros((self.rows, 8), dtype=torch.bfloat16),
+            self.batch,
+            None,
+            self.scatter_modes,
+        )
+        self.assertEqual(self.norm.call_count, 1)
+        self.assertEqual(self.proj.call_count, 1)
+        self.assertEqual(self.quant_method.calls, [])
 
 
 if __name__ == "__main__":
