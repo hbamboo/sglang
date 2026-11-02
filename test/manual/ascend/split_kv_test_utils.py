@@ -59,6 +59,7 @@ SOURCE_FILES = [
     f"{FRAMEWORK}/python/sglang/srt/hardware_backend/npu/modules/split_kv_b_proj.py",
     f"{FRAMEWORK}/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py",
     f"{FRAMEWORK}/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py",
+    f"{FRAMEWORK}/python/sglang/srt/model_executor/model_runner.py",
     f"{FRAMEWORK}/python/sglang/srt/environ.py",
 ]
 

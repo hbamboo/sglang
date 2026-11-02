@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import torch
@@ -452,3 +453,37 @@ def maybe_forward_split_kv_b_proj(
 def split_kv_b_proj_state(module: object) -> Optional[SplitKVBProjState]:
     """Diagnostic accessor used by tests/reports."""
     return getattr(module, _STATE_ATTR, None)
+
+
+def finalize_split_kv_b_proj(model: object) -> int:
+    """Refresh split state after the loader's final post-processing loop.
+
+    ``post_load_weights`` runs at the end of the model's ``load_weights``,
+    before the loader invokes ``quant_method.process_weights_after_loading`` on
+    each module.  A supported unquantized module is a no-op there, but if any
+    later stage replaces/moves the parameter, this final hook rebuilds Wk/Wv
+    from the true final weight instead of leaving a permanently stale state.
+    Returns the number of modules rebuilt.
+    """
+    rebuilt = 0
+    for module in model.modules():
+        state = getattr(module, _STATE_ATTR, None)
+        if state is None or _state_is_current(state, module):
+            continue
+        attn_view = SimpleNamespace(
+            num_local_heads=state.num_heads,
+            qk_nope_head_dim=state.k_head_dim,
+            v_head_dim=state.v_head_dim,
+            kv_lora_rank=state.input_size,
+            use_dsa=False,
+        )
+        new_state, reason = prepare_split_kv_b_proj(
+            attn_view, module, force=True
+        )
+        if new_state is not None:
+            rebuilt += 1
+            logger.debug(
+                "SGLANG_NPU_SPLIT_KV_B_PROJ refreshed after final load: %s",
+                reason,
+            )
+    return rebuilt

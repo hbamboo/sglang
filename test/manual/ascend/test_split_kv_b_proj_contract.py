@@ -239,6 +239,33 @@ def test_state_lifecycle_cpu():
         mod.weight = mod.weight.double()
         assert skv.maybe_forward_split_kv_b_proj(attn, mod, x.double(), None) is None
 
+        # Final after-load hook: refresh only stale derived state.
+        state_f, reason_f = skv.prepare_split_kv_b_proj(attn, mod, force=True)
+        assert state_f is not None
+
+        class Holder(torch.nn.Module):
+            def __init__(self, child):
+                super().__init__()
+                self.kv = child
+
+        holder = Holder(mod)
+        assert skv.finalize_split_kv_b_proj(holder) == 0
+        final_weight = torch.randn_like(mod.weight)
+        mod.weight = torch.nn.Parameter(final_weight)
+        assert skv.maybe_forward_split_kv_b_proj(
+            attn, mod, x.double(), None
+        ) is None
+        assert skv.finalize_split_kv_b_proj(holder) == 1
+        state_g = skv.split_kv_b_proj_state(mod)
+        assert state_g is not None and skv._state_is_current(state_g, mod)
+        exp_k, exp_v, _, _ = skv.split_kv_b_proj_weight(
+            final_weight, None, 4, 8, 12
+        )
+        assert torch.equal(state_g.w_k, exp_k) and torch.equal(state_g.w_v, exp_v)
+        assert skv.maybe_forward_split_kv_b_proj(
+            attn, mod, x.double(), None
+        ) is not None
+
         skv.invalidate_split_kv_b_proj(mod)
         assert skv.split_kv_b_proj_state(mod) is None
         assert mod._buffers["_split_kv_b_proj_w_k"] is None
