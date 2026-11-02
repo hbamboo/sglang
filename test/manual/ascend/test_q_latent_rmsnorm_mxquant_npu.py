@@ -1095,43 +1095,90 @@ def time_kernel_alternating(rows, seed, eps, device, warmup, iters,
 # ---------------------------------------------------------------------------
 # profiling
 # ---------------------------------------------------------------------------
+def _trace_events(data):
+    if isinstance(data, list):
+        return data, "list"
+    if isinstance(data, dict):
+        events = data.get("traceEvents")
+        if isinstance(events, list):
+            return events, "dict"
+    return None, type(data).__name__
+
+
+def _is_device_event(event):
+    """Installed torch_npu marks device kernels via args['Task Type'].
+
+    Chrome-trace category is None for these events, so category-only detection
+    misses every kernel.
+    """
+    if not isinstance(event, dict) or event.get("ph") != "X":
+        return False
+    args = event.get("args")
+    if isinstance(args, dict) and "Task Type" in args:
+        return True
+    cat = str(event.get("cat") or "").lower()
+    return bool(event.get("name")) and (
+        "kernel" in cat or "npu" in cat or "aic" in cat
+    )
+
+
 def summarize_trace(path):
     try:
         with open(path) as f:
             data = json.load(f)
-        events = data.get("traceEvents", [])
-        kernels = [
-            e
-            for e in events
-            if e.get("ph") == "X"
-            and (
-                "kernel" in str(e.get("cat", "")).lower()
-                or "npu" in str(e.get("cat", "")).lower()
-                or "aic" in str(e.get("cat", "")).lower()
-            )
-        ]
-        if not kernels:
-            kernels = [
-                e
-                for e in events
-                if e.get("ph") == "X"
-                and e.get("cat")
-                not in ("cpu_op", "user_annotation", "python_function")
-            ]
+        events, fmt = _trace_events(data)
+        if events is None:
+            return {
+                "path": path,
+                "format": fmt,
+                "ok": False,
+                "error": "unsupported_trace_shape",
+            }
+        device_events = [e for e in events if _is_device_event(e)]
         by_name = {}
-        for e in kernels:
-            item = by_name.setdefault(e.get("name", "?"), {"count": 0, "dur_us": 0.0})
+        for e in device_events:
+            item = by_name.setdefault(
+                e.get("name", "?"), {"count": 0, "dur_us": 0.0}
+            )
             item["count"] += 1
             item["dur_us"] += float(e.get("dur", 0.0))
+        if not device_events:
+            return {
+                "path": path,
+                "format": fmt,
+                "ok": False,
+                "error": "no_device_events",
+                "event_count": len(events),
+                "device_event_count": 0,
+                "kernels": {},
+            }
         return {
             "path": path,
-            "kernel_event_count": len(kernels),
+            "format": fmt,
+            "ok": True,
+            "event_count": len(events),
+            "device_event_count": len(device_events),
             "kernels": dict(
                 sorted(by_name.items(), key=lambda kv: kv[1]["dur_us"], reverse=True)
             ),
         }
     except Exception as exc:
-        return {"path": path, "error": repr(exc)}
+        return {"path": path, "ok": False, "error": repr(exc)}
+
+
+def profiling_results_ok(results):
+    """A profiling run is valid only if every arm has real device kernels."""
+    if not isinstance(results, dict) or not results:
+        return False
+    for value in results.values():
+        if not isinstance(value, dict) or not value.get("ok"):
+            return False
+        trace = value.get("trace")
+        if not isinstance(trace, dict) or not trace.get("ok"):
+            return False
+        if trace.get("error") or trace.get("device_event_count", 0) <= 0:
+            return False
+    return True
 
 
 def _profile(label, fn, out_dir):
@@ -1159,12 +1206,21 @@ def _profile(label, fn, out_dir):
             )
         except Exception as exc:
             table = f"key_averages unavailable: {exc!r}"
+        if trace_path is None:
+            return {"ok": False, "error": "trace_export_failed", "table": table}
+        summary = summarize_trace(trace_path)
         return {
-            "trace": summarize_trace(trace_path) if trace_path else None,
+            "ok": bool(summary.get("ok")),
+            "error": summary.get("error"),
+            "trace": summary,
             "table": table,
         }
     except Exception as exc:
-        return {"error": repr(exc), "traceback": traceback.format_exc()}
+        return {
+            "ok": False,
+            "error": repr(exc),
+            "traceback": traceback.format_exc(),
+        }
 
 
 def profile_chains(rows, seed, eps, device, out_dir):
@@ -1344,9 +1400,15 @@ def main():
             result["profiling"] = profile_chains(
                 3787, 1234, 1e-6, device, os.path.join(args.out_dir, "profiling")
             )
-            profiling_ok = all(
-                "error" not in v for v in result["profiling"].values()
-            )
+            profiling_expected = {
+                "kernel_old",
+                "kernel_new",
+                "prepare_old",
+                "prepare_new",
+            }
+            profiling_ok = profiling_expected <= set(
+                result["profiling"]
+            ) and profiling_results_ok(result["profiling"])
         except Exception as exc:
             profiling_ok = False
             result["profiling"] = {

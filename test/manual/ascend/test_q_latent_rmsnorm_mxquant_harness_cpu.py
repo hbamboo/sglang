@@ -8,8 +8,10 @@ directly and only its pure helpers are exercised.
 """
 
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 import torch
@@ -154,6 +156,96 @@ class AcceptanceStatsTest(unittest.TestCase):
         )
         self.assertEqual(H.CRITERIA["bf16_downstream"]["max_abs"], 1.0)
         self.assertEqual(H.CRITERIA["near_exact_diagnostic"]["atol"], 2.0**-8)
+
+
+class TraceParserTest(unittest.TestCase):
+    DEVICE = [
+        {
+            "ph": "X",
+            "name": "aclnnSlice",
+            "dur": 1.5,
+            "cat": None,
+            "args": {"Task Type": "KERNEL_AIVEC"},
+        },
+        {
+            "ph": "X",
+            "name": "aclnnRmsNormDynamicMxQuant",
+            "dur": 2.5,
+            "cat": None,
+            "args": {"Task Type": "KERNEL_AIVEC"},
+        },
+        {"ph": "X", "name": "cpu_op", "dur": 0.1, "cat": "cpu_op", "args": {}},
+        {"ph": "M", "name": "metadata", "args": {}},
+    ]
+
+    def write_json(self, obj, tmp):
+        path = os.path.join(tmp, "trace.json")
+        with open(path, "w") as f:
+            json.dump(obj, f)
+        return path
+
+    def test_list_trace_with_task_type_is_device_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = H.summarize_trace(self.write_json(self.DEVICE, tmp))
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["format"], "list")
+        self.assertEqual(summary["device_event_count"], 2)
+        self.assertIn("aclnnSlice", summary["kernels"])
+        self.assertIn("aclnnRmsNormDynamicMxQuant", summary["kernels"])
+        self.assertNotIn("cpu_op", summary["kernels"])
+
+    def test_dict_trace_events_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = H.summarize_trace(
+                self.write_json({"traceEvents": self.DEVICE}, tmp)
+            )
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["format"], "dict")
+        self.assertEqual(summary["device_event_count"], 2)
+
+    def test_no_device_events_is_profiling_failure(self):
+        only_host = [
+            {"ph": "X", "name": "cpu_op", "dur": 0.1, "cat": "cpu_op", "args": {}},
+            {"ph": "M", "name": "meta", "args": {}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = H.summarize_trace(self.write_json(only_host, tmp))
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["error"], "no_device_events")
+
+    def test_malformed_or_unknown_trace_is_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.json")
+            open(path, "w").write("{not json")
+            summary = H.summarize_trace(path)
+            self.assertFalse(summary["ok"])
+            self.assertIn("error", summary)
+            summary = H.summarize_trace(self.write_json({}, tmp))
+            self.assertFalse(summary["ok"])
+            self.assertEqual(summary["error"], "unsupported_trace_shape")
+
+    def test_profiling_results_require_nested_device_events(self):
+        good_trace = {
+            "ok": True,
+            "device_event_count": 1,
+            "kernels": {"aclnnSlice": {"count": 1, "dur_us": 1.0}},
+        }
+        good = {"kernel_old": {"ok": True, "trace": good_trace}}
+        self.assertTrue(H.profiling_results_ok(good))
+        bad_error = {
+            "kernel_old": {
+                "ok": True,
+                "trace": {"ok": False, "error": "no_device_events"},
+            }
+        }
+        self.assertFalse(H.profiling_results_ok(bad_error))
+        bad_top = {"kernel_old": {"ok": False, "error": "trace_export_failed"}}
+        self.assertFalse(H.profiling_results_ok(bad_top))
+        missing_events = {
+            "kernel_old": {"ok": True, "trace": {"ok": True, "device_event_count": 0}}
+        }
+        self.assertFalse(H.profiling_results_ok(missing_events))
+        self.assertFalse(H.profiling_results_ok({}))
 
 
 class Fp8GatherTest(unittest.TestCase):

@@ -155,6 +155,8 @@ class HelperContractTest(unittest.TestCase):
         self._old_compile = qlm._compiler_is_compiling
         self._old_capture = qlm._device_is_capturing
         self._old_input_is_npu = qlm._input_is_npu
+        self._old_canonical = qlm._CANONICAL_CPL_STATE
+        qlm._CANONICAL_CPL_STATE = None
         qlm._FUSION_ENABLED = True
         qlm._compiler_is_compiling = lambda: False
         qlm._device_is_capturing = lambda: False
@@ -170,6 +172,7 @@ class HelperContractTest(unittest.TestCase):
         qlm._compiler_is_compiling = self._old_compile
         qlm._device_is_capturing = self._old_capture
         qlm._input_is_npu = self._old_input_is_npu
+        qlm._CANONICAL_CPL_STATE = self._old_canonical
 
     def call(self, norm=None, proj=None, x=None, **kwargs):
         norm = norm if norm is not None else FakeNorm()
@@ -469,6 +472,75 @@ class HelperContractTest(unittest.TestCase):
                 else:
                     self.assertEqual(proj.quant_method.calls, [])
 
+    def test_global_class_forward_replacement_after_canonicalization_rejected(self):
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+        norm, proj = make_fakes()
+        # First gate call establishes and validates the canonical reference.
+        self.assertIsNone(qlm.fusion_blocker(norm, proj, x))
+        self.assertIsNotNone(qlm._CANONICAL_CPL_STATE[1])
+
+        original = ColumnParallelLinear.forward
+
+        def patched_forward(self, input_):
+            raise AssertionError("patched class forward must not be bypassed")
+
+        try:
+            ColumnParallelLinear.forward = patched_forward
+            norm2, proj2 = make_fakes()
+            self.assertEqual(
+                qlm.fusion_blocker(norm2, proj2, x), "proj_forward_override"
+            )
+            self.assertIsNone(self.call(norm=norm2, proj=proj2, x=x))
+            self.assertEqual(self.op.calls, [])
+            self.assertEqual(proj2.quant_method.calls, [])
+            self.assertEqual(proj2.quant_method.tensor_calls, [])
+        finally:
+            ColumnParallelLinear.forward = original
+
+        # Restoring the class re-enables the route against the same canonical.
+        norm3, proj3 = make_fakes()
+        self.assertIsNone(qlm.fusion_blocker(norm3, proj3, x))
+
+    def test_unknown_or_wrapped_forward_before_establishment_fails_closed(self):
+        from functools import wraps
+
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+        original = ColumnParallelLinear.forward
+
+        def patched_forward(self, input_):
+            raise AssertionError("patched class forward must not be bypassed")
+
+        @wraps(original)
+        def wrapped_forward(self, input_):
+            return original(self, input_)
+
+        for name, replacement in (
+            ("unknown", patched_forward),
+            ("wrapped", wrapped_forward),
+        ):
+            with self.subTest(name=name):
+                qlm._CANONICAL_CPL_STATE = None  # simulate pre-init
+                try:
+                    ColumnParallelLinear.forward = replacement
+                    norm, proj = make_fakes()
+                    self.assertEqual(
+                        qlm.fusion_blocker(norm, proj, x),
+                        "proj_forward_provenance_unknown",
+                    )
+                    self.assertIsNone(self.call(norm=norm, proj=proj, x=x))
+                    self.assertEqual(self.op.calls, [])
+                    self.assertEqual(proj.quant_method.calls, [])
+                    self.assertEqual(proj.quant_method.tensor_calls, [])
+                    # Restoring the class must not reopen a failed establishment.
+                    ColumnParallelLinear.forward = original
+                    norm2, proj2 = make_fakes()
+                    self.assertEqual(
+                        qlm.fusion_blocker(norm2, proj2, x),
+                        "proj_forward_provenance_unknown",
+                    )
+                finally:
+                    ColumnParallelLinear.forward = original
+
     def test_plain_column_parallel_forward_equals_direct_consumer(self):
         proj = make_plain_proj(68)
         x = torch.zeros((4, 768), dtype=torch.bfloat16)
@@ -645,7 +717,9 @@ class PrepareRouteContractTest(unittest.TestCase):
             "compile": qlm._compiler_is_compiling,
             "capture": qlm._device_is_capturing,
             "input_is_npu": qlm._input_is_npu,
+            "canonical": qlm._CANONICAL_CPL_STATE,
         }
+        qlm._CANONICAL_CPL_STATE = None
         qlm._FUSION_ENABLED = True
         qlm._compiler_is_compiling = lambda: False
         qlm._device_is_capturing = lambda: False
@@ -669,6 +743,7 @@ class PrepareRouteContractTest(unittest.TestCase):
         qlm._compiler_is_compiling = self._old_qlm["compile"]
         qlm._device_is_capturing = self._old_qlm["capture"]
         qlm._input_is_npu = self._old_qlm["input_is_npu"]
+        qlm._CANONICAL_CPL_STATE = self._old_qlm["canonical"]
 
     def fixture(
         self,

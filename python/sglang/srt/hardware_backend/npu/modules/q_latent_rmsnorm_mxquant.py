@@ -8,6 +8,10 @@ Baseline Q-latent path (``forward_mha_prepare_npu``)::
     q = q_a_layernorm(q)       # BF16 RMSNorm, original gamma/epsilon
     q = q_b_proj(q)[0]         # MXFP8 linear: activation DynamicMxQuant + GEMM
 
+``q`` is a view of the ``[T, 1344]`` qkv-a output (q_lora 768 + kv 576), so its
+row stride is **1344**, not 576.  The split itself is preserved and is not
+fused here.
+
 This helper keeps the preceding ``split`` untouched and replaces only the
 RMSNorm + activation quantisation pair with the fused Ascend kernel
 ``npu_rms_norm_dynamic_mx_quant``.  The resulting ``(values, e8m0_scale)`` pair
@@ -27,6 +31,7 @@ back instead of enabling an unverified route.
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Optional
 
@@ -44,6 +49,11 @@ _FUSION_ENABLED = os.environ.get(FLAG_ENV, "").strip().lower() in (
     "yes",
     "on",
 )
+
+# Canonical ColumnParallelLinear.forward, established exactly once after the
+# safety gates.  ``None`` = not initialised; ``(None, None)`` = provenance was
+# already unknown/wrapped at establishment and the gate must stay closed.
+_CANONICAL_CPL_STATE = None
 
 
 def fusion_enabled() -> bool:
@@ -81,25 +91,63 @@ def _same_device(a, b) -> bool:
     return (a.type, a.index) == (b.type, b.index)
 
 
+def _canonical_plain_column_parallel():
+    """Resolve and validate the canonical plain ColumnParallelLinear once.
+
+    Provenance is checked at establishment (source module/file/qualname), then
+    the function object is immutable for the process.  A class-level forward
+    replacement is detected by comparing the current bound method's
+    ``__func__`` with this reference.  If the class is already unknown or
+    wrapped before establishment, the gate fails closed for the rest of the
+    process.
+    """
+    global _CANONICAL_CPL_STATE
+    if _CANONICAL_CPL_STATE is not None:
+        return _CANONICAL_CPL_STATE
+    state = (None, None)
+    try:
+        from sglang.srt.layers.linear import ColumnParallelLinear
+
+        forward = getattr(ColumnParallelLinear, "forward", None)
+        code = getattr(forward, "__code__", None)
+        filename = getattr(code, "co_filename", "").replace("\\", "/")
+        if (
+            inspect.isfunction(forward)
+            and getattr(forward, "__module__", None)
+            == "sglang.srt.layers.linear"
+            and getattr(forward, "__qualname__", None)
+            == "ColumnParallelLinear.forward"
+            and filename.endswith("sglang/srt/layers/linear.py")
+        ):
+            state = (ColumnParallelLinear, forward)
+    except Exception:
+        state = (None, None)
+    _CANONICAL_CPL_STATE = state
+    return state
+
+
 def _consumer_forward_blocker(proj) -> Optional[str]:
-    """Only the plain ColumnParallelLinear forward may be bypassed.
+    """Only the canonical plain ColumnParallelLinear forward may be bypassed.
 
     Directly calling ``quant_method.apply`` is equivalent to
     ``ColumnParallelLinear.forward`` only when the layer is that exact class,
-    has no per-instance/class forward override, is TP1, does not gather its
-    output, and has no bias/skip-bias behavior.  Resolved lazily and only after
-    the flag/compile/device/capture gates, so default-off startup pays nothing
-    and import cycles are avoided.
+    its bound forward is the canonical unmodified function, is TP1, does not
+    gather its output, and has no bias/skip-bias/parametrization behavior.
+    Resolved lazily and only after the flag/compile/device/capture gates, so
+    default-off startup pays nothing and import cycles fail closed.
     """
-    try:
-        from sglang.srt.layers.linear import ColumnParallelLinear
-    except Exception:
-        return "consumer_class_import_error"
-    if type(proj) is not ColumnParallelLinear:
+    cpl_class, canonical_forward = _canonical_plain_column_parallel()
+    if cpl_class is None or canonical_forward is None:
+        return "proj_forward_provenance_unknown"
+    if type(proj) is not cpl_class:
         return "proj_not_plain_column_parallel"
     if "forward" in getattr(proj, "__dict__", {}):
         return "proj_instance_forward_override"
-    if getattr(type(proj), "forward", None) is not ColumnParallelLinear.forward:
+    bound_forward = getattr(proj, "forward", None)
+    if (
+        not inspect.ismethod(bound_forward)
+        or getattr(bound_forward, "__func__", None) is not canonical_forward
+    ):
         return "proj_forward_override"
     if getattr(proj, "skip_bias_add", False):
         return "proj_skip_bias_add"
@@ -262,9 +310,9 @@ def forward_q_latent_rmsnorm_mxquant(
 ) -> Optional[torch.Tensor]:
     """Run fused norm+quant followed by ``proj``; return BF16 output or None.
 
-    ``x`` is the q-latent view produced by the caller's ``split`` (typically
-    stride ``kv_lora_rank + qk_rope_head_dim``).  ``None`` means "unsupported,
-    run the original path"; the caller owns that fallback.
+    ``x`` is the q-latent view produced by the caller's ``split`` of the
+    ``[T, 1344]`` qkv-a output; its row stride is 1344 (not 576).  ``None``
+    means "unsupported, run the original path"; the caller owns that fallback.
     """
     if (
         fusion_blocker(
