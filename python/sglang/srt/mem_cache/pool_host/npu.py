@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import replace
 from typing import Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
-
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 
 def _transfer_kv_pages(device, host, device_indices, host_indices, page_size, h2d):
@@ -35,6 +37,25 @@ def _transfer_kv_pages(device, host, device_indices, host_indices, page_size, h2
     )
 
 
+def _transfer_expanded_kv_pages(
+    device_k, host_k, device_v, host_v, device_indices, host_indices, page_size, h2d
+):
+    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+
+    # Expanded device layers are independent allocations. Copy a K/V pair with
+    # a singleton layer axis instead of stacking them or inventing a layer pitch.
+    transfer_kv_dim_exchange(
+        device_k=device_k,
+        host_k=host_k,
+        device_v=device_v,
+        host_v=host_v,
+        device_indices=device_indices,
+        host_indices=host_indices,
+        page_size=page_size,
+        direction=TransferDirection.H2D if h2d else TransferDirection.D2H,
+    )
+
+
 class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     """Page-major host payloads, using Ascend's all-layer async page copies.
 
@@ -42,7 +63,9 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     A unified MLA device buffer is copied as one component, never through its
     non-contiguous latent/rope views. Legacy split KV and an optional indexer
     are stored in separate, contiguous sections *within* the same host page.
-    This also gives storage backends one complete payload/pointer per page.
+    Expanded prefill pools mirror their independent per-layer K/V allocations
+    as well as latent KV. Both copies share the same complete host page payload
+    and are transferred before the controller records its completion event.
     """
 
     def __init__(
@@ -70,8 +93,6 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             raise ValueError("Ascend MLA HiCache does not support DCP or layer sharding")
         if mtp_draft_device_pools:
             raise ValueError("Ascend MLA HiCache does not support packed MTP pools")
-        if getattr(device_pool, "prefill_expanded_geometry", None) is not None:
-            raise ValueError("Ascend MLA HiCache cannot restore expanded prefill KV")
         self._cache_layout_flags = (
             get_bool_env_var("SGLANG_USE_FIA_NZ"),
             envs.SGLANG_NPU_DISABLE_YARN_KV_SINK.get(),
@@ -82,12 +103,15 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         width = device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
         if override_kv_cache_dim is not None and override_kv_cache_dim != width:
             raise ValueError("Ascend MLA HiCache requires the complete latent/rope KV")
-        self._component_names = ("kv_buffer",) if self.unified_kv else (
-            "k_buffer",
-            "v_buffer",
+        self._component_names = (
+            ("kv_buffer",) if self.unified_kv else ("k_buffer", "v_buffer")
         )
         if getattr(device_pool, "index_k_buffer", None) is not None:
             self._component_names += ("index_k_buffer",)
+        reference = getattr(device_pool, self._component_names[0], None)
+        if not isinstance(reference, torch.Tensor) or reference.ndim != 5:
+            raise ValueError("Unsupported Ascend MLA HiCache primary device buffer")
+        device_pages = reference.shape[1]
         for name in self._component_names:
             buf = getattr(device_pool, name)
             if (
@@ -95,10 +119,16 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
                 or buf.ndim != 5
                 or not buf.is_contiguous()
                 or buf.shape[0] != device_pool.layer_num
+                or buf.shape[1] != device_pages
                 or buf.shape[2:4] != (page_size, 1)
                 or buf.dtype != device_pool.store_dtype
+                or buf.device != reference.device
             ):
                 raise ValueError(f"Unsupported Ascend MLA HiCache device buffer {name}")
+        self._expanded_geometry = self._validate_expanded_buffers(
+            device_pool, device_pages, page_size
+        )
+        self._expanded_enqueue_logged = set()
         self.can_use_jit = False
         # Keep the MLA type for storage-backend dispatch, but bypass its CUDA
         # pointer-array initialization and its layer-first buffer assumptions.
@@ -114,6 +144,46 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             allocator_type,
             pool_label=pool_label,
         )
+        device_pool._hicache_expanded_host_mirror = (
+            self._expanded_geometry is not None
+        )
+
+    @staticmethod
+    def _validate_expanded_buffers(device_pool, device_pages, page_size):
+        geometry = getattr(device_pool, "prefill_expanded_geometry", None)
+        if geometry is None:
+            return None
+        dimensions = tuple(
+            getattr(geometry, name, 0) for name in ("heads", "key_dim", "value_dim")
+        )
+        if any(
+            not isinstance(dimension, int) or dimension <= 0
+            for dimension in dimensions
+        ):
+            raise ValueError("Ascend HiCache requires valid expanded KV geometry")
+        heads, key_dim, value_dim = dimensions
+        for name, width in (
+            ("prefill_k_buffer", key_dim),
+            ("prefill_v_buffer", value_dim),
+        ):
+            buffers = getattr(device_pool, name, None)
+            if (
+                not isinstance(buffers, (list, tuple))
+                or len(buffers) != device_pool.layer_num
+            ):
+                raise ValueError(f"Ascend HiCache requires every expanded layer in {name}")
+            for layer_id, buffer in enumerate(buffers):
+                if (
+                    not isinstance(buffer, torch.Tensor)
+                    or buffer.shape != (device_pages, page_size, heads, width)
+                    or buffer.dtype != device_pool.store_dtype
+                    or not buffer.is_contiguous()
+                    or buffer.device != getattr(device_pool, "k_buffer").device
+                ):
+                    raise ValueError(
+                        f"Unsupported Ascend HiCache expanded {name} layer {layer_id}"
+                    )
+        return dimensions
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
@@ -122,7 +192,13 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         self.kv_cache_dim = sum(
             getattr(self.device_pool, name).shape[-1] for name in self._component_names
         )
-        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.expanded_cache_dim = 0
+        if self._expanded_geometry is not None:
+            heads, key_dim, value_dim = self._expanded_geometry
+            self.expanded_cache_dim = heads * (key_dim + value_dim)
+        self.token_stride_size = (
+            self.kv_cache_dim + self.expanded_cache_dim
+        ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
         return self.layout_dim
 
@@ -130,7 +206,11 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         return self.size_per_token
 
     def init_kv_buffer(self):
-        page_elements = self.layer_num * self.page_size * self.kv_cache_dim
+        page_elements = (
+            self.layer_num
+            * self.page_size
+            * (self.kv_cache_dim + self.expanded_cache_dim)
+        )
         device_type = str(self.device_pool.device).split(":")[0]
         buffer = ALLOC_MEMORY_FUNCS[device_type](
             (self.page_num, page_elements),
@@ -157,6 +237,20 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             offset += count
         if "index_k_buffer" not in self._component_names:
             self.index_k_buffer = None
+        self._expanded_host_k = self._expanded_host_v = None
+        if self._expanded_geometry is not None:
+            heads, key_dim, value_dim = self._expanded_geometry
+            for name, width in (
+                ("_expanded_host_k", key_dim),
+                ("_expanded_host_v", value_dim),
+            ):
+                count = self.layer_num * self.page_size * heads * width
+                view = buffer[:, offset : offset + count].view(
+                    self.page_num, self.layer_num, self.page_size, heads, width
+                )
+                setattr(self, name, view)
+                offset += count
+        assert offset == page_elements
         return buffer
 
     @staticmethod
@@ -201,6 +295,32 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
                 self.page_size,
                 h2d,
             )
+        if self._expanded_geometry is not None:
+            for layer_id in range(self.layer_num):
+                _transfer_expanded_kv_pages(
+                    device_pool.prefill_k_buffer[layer_id].unsqueeze(0),
+                    self._expanded_host_k[:, layer_id : layer_id + 1],
+                    device_pool.prefill_v_buffer[layer_id].unsqueeze(0),
+                    self._expanded_host_v[:, layer_id : layer_id + 1],
+                    device_indices,
+                    host_indices,
+                    self.page_size,
+                    h2d,
+                )
+            direction = "H2D" if h2d else "D2H"
+            if direction not in self._expanded_enqueue_logged:
+                self._expanded_enqueue_logged.add(direction)
+                heads, key_dim, value_dim = self._expanded_geometry
+                logger.info(
+                    "Ascend HiCache dual KV %s first enqueue: pages=%s, layers=%s, "
+                    "heads=%s, key_dim=%s, value_dim=%s",
+                    direction,
+                    host_indices.numel() // self.page_size,
+                    self.layer_num,
+                    heads,
+                    key_dim,
+                    value_dim,
+                )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -269,19 +389,20 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             (name, getattr(self.device_pool, name).shape[-1])
             for name in self._component_names
         )
-        signature = repr(
-            (
-                str(self.dtype),
-                self.page_size,
-                self.layer_num,
-                self.start_layer,
-                self.end_layer,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                self._cache_layout_flags,
-                components,
-            )
+        signature_fields = (
+            str(self.dtype),
+            self.page_size,
+            self.layer_num,
+            self.start_layer,
+            self.end_layer,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self._cache_layout_flags,
+            components,
         )
+        if self._expanded_geometry is not None:
+            signature_fields += (("expanded-mirror-v1", self._expanded_geometry),)
+        signature = repr(signature_fields)
         return "ascend-mla-v1-" + hashlib.sha256(signature.encode()).hexdigest()[:16]
 
     def prepare_storage_config(self, backend_name, storage_config):
@@ -314,3 +435,4 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         super().destroy()
         self._host_components = []
         self.k_buffer = self.v_buffer = self.index_k_buffer = None
+        self._expanded_host_k = self._expanded_host_v = None
