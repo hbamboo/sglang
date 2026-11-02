@@ -760,6 +760,8 @@ class Envs:
     # Eager FAS candidate for guarded large expanded PD-prefill batches.
     SGLANG_NPU_PREFILL_FAS = EnvBool(False)
     SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES = EnvBool(False)
+    # Retire ready previous PD-prefill output before submitting the next batch.
+    SGLANG_NPU_PD_PREFILL_EARLY_RESULT = EnvBool(False)
     # Reuse existing MXFP8 once before top-k expansion on measured large PD prefill.
     SGLANG_NPU_MOE_PREQUANT_ROUTING = EnvBool(False)
     # Stable byte routing for qualified eager PD prefill; optional kernel companion.

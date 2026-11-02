@@ -110,6 +110,8 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+    # Host-side proof that copy_done.record() succeeded, not device readiness.
+    copy_done_recorded: bool = False
 
     @property
     def has_sampled_token_ids(self) -> bool:
@@ -123,6 +125,7 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        self.copy_done_recorded = False
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -176,6 +179,7 @@ class GenerationBatchResult:
         self.copy_auxiliary_output_to_cpu()
 
         self.copy_done.record()
+        self.copy_done_recorded = True
 
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:

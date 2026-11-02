@@ -32,6 +32,10 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.early_prefill_result import (
+    supports_early_prefill_result,
+    try_process_ready_prefill_result,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
@@ -74,6 +78,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_parallel,
     get_schedule,
 )
@@ -632,6 +637,14 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        early_result_enabled = (
+            _is_npu
+            and envs.SGLANG_NPU_PD_PREFILL_EARLY_RESULT.get()
+            and supports_early_prefill_result(
+                self, get_exec().graph.cuda_graph_config,
+                get_schedule().chunked_prefill_size,
+            )
+        )
 
         while True:
             # Receive requests
@@ -654,6 +667,11 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.cur_batch_for_debug = batch
 
+            previous_processed = (
+                early_result_enabled
+                and try_process_ready_prefill_result(self, batch)
+            )
+
             # Launch the current batch
             if batch:
                 if self.enable_staging:
@@ -666,8 +684,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not previous_processed:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
