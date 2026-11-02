@@ -249,7 +249,7 @@ def test_state_lifecycle_cpu():
                 self.kv = child
 
         holder = Holder(mod)
-        assert skv.finalize_split_kv_b_proj(holder) == 0
+        assert skv.finalize_split_kv_b_proj(holder) == 1
         final_weight = torch.randn_like(mod.weight)
         mod.weight = torch.nn.Parameter(final_weight)
         assert skv.maybe_forward_split_kv_b_proj(
@@ -262,6 +262,21 @@ def test_state_lifecycle_cpu():
             final_weight, None, 4, 8, 12
         )
         assert torch.equal(state_g.w_k, exp_k) and torch.equal(state_g.w_v, exp_v)
+        assert skv.maybe_forward_split_kv_b_proj(
+            attn, mod, x.double(), None
+        ) is not None
+
+        # Late param.data.copy_ does not bump _version; the finalizer still
+        # rebuilds from the copied final weight.
+        late = torch.randn_like(mod.weight)
+        late_version = mod.weight._version
+        with torch.no_grad():
+            mod.weight.data.copy_(late)
+        assert mod.weight._version == late_version
+        assert skv.finalize_split_kv_b_proj(holder) == 1
+        state_h = skv.split_kv_b_proj_state(mod)
+        exp_k, exp_v, _, _ = skv.split_kv_b_proj_weight(late, None, 4, 8, 12)
+        assert torch.equal(state_h.w_k, exp_k) and torch.equal(state_h.w_v, exp_v)
         assert skv.maybe_forward_split_kv_b_proj(
             attn, mod, x.double(), None
         ) is not None

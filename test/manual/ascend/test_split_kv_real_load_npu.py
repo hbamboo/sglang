@@ -239,11 +239,14 @@ def real_load_and_final_process(cfg, quant_config, layer, ckpt):
         npu_utils.npu_format_cast = orig_cast
     after_final = meta(kv.weight)
     state_after_final = skv.split_kv_b_proj_state(kv)
+    # The finalizer intentionally rebuilds every prepared module even when the
+    # metadata looks current: param.data.copy_ leaves pointer/version unchanged.
     refreshed = skv.finalize_split_kv_b_proj(layer)
-    assert refreshed == 0
-    assert skv._state_is_current(state_after_final, kv)
-    assert state_after_final is state_after_load
-    assert skv._state_is_current(state_after_final, kv)
+    assert refreshed == 1
+    state_after_finalizer = skv.split_kv_b_proj_state(kv)
+    assert state_after_finalizer is not None
+    assert state_after_finalizer is not state_after_final
+    assert skv._state_is_current(state_after_finalizer, kv)
     assert before_final == after_final
     assert cast_calls["n"] == 0
     assert torch.equal(kv.weight.detach().cpu(), weight)
@@ -270,6 +273,7 @@ def real_load_and_final_process(cfg, quant_config, layer, ckpt):
         "state_current_after_final_process": True,
         "split_matches_checkpoint": True,
         "finalizer_refreshed_layers": refreshed,
+        "finalizer_rebuilt_current_target": True,
         "state_current_after_finalizer": True,
     }
 
@@ -545,6 +549,47 @@ def profile_route(attn, fx, ckpt):
     return {"full_prepare": full, "kv_only": isolated}
 
 
+def late_data_copy_refresh(attn, fx, ckpt):
+    """Late final-stage param.data.copy_ must be picked up by the finalizer."""
+    kv = attn.kv_b_proj
+    late = ckpt["weight"].to(DEV).clone()
+    late.mul_(1.5)
+    ptr_before, version_before = kv.weight.data_ptr(), kv.weight._version
+    with torch.no_grad():
+        kv.weight.data.copy_(late)
+    assert kv.weight.data_ptr() == ptr_before
+    assert kv.weight._version == version_before
+    stale = skv.split_kv_b_proj_state(kv)
+    assert stale is not None and skv._state_is_current(stale, kv)
+    refreshed = skv.finalize_split_kv_b_proj(attn)
+    assert refreshed == 1
+    fresh = skv.split_kv_b_proj_state(kv)
+    assert fresh is not None and fresh is not stale
+    exp_k, exp_v, _, _ = skv.split_kv_b_proj_weight(late, None, 20, DK, DV)
+    assert tu.close_stats(fresh.w_k, exp_k, 0.0, 0.0)["bad"] == 0
+    assert tu.close_stats(fresh.w_v, exp_v, 0.0, 0.0)["bad"] == 0
+    kv_a4d = fx["fixture"].static_kv_a
+    out = skv.maybe_forward_split_kv_b_proj(attn, kv, kv_a4d, fx["fb"])
+    assert out is not None
+    k_nope, v = out
+    expected = torch.nn.functional.linear(kv_a4d, late).view(
+        -1, 20, DK + DV
+    )
+    st_k = tu.close_stats(k_nope, expected[..., :DK], 0.0, 0.0)
+    st_v = tu.close_stats(v, expected[..., DK:], 0.0, 0.0)
+    assert st_k["bad"] == 0 and st_v["bad"] == 0
+    return {
+        "ptr_unchanged": True,
+        "version_unchanged": True,
+        "stale_metadata_looked_current": True,
+        "finalizer_refreshed_layers": refreshed,
+        "split_matches_late_copy": True,
+        "route_hit": True,
+        "late_old_route_max_abs_k": st_k["max_abs"],
+        "late_old_route_max_abs_v": st_v["max_abs"],
+    }
+
+
 def main():
     def run(metrics):
         cfg, quant_config, quant_description, layer = build_real_layer()
@@ -598,6 +643,7 @@ def main():
         try:
             metrics["route"] = route_case(attn, fx, ckpt)
             metrics["profile"] = profile_route(attn, fx, ckpt)
+            metrics["late_data_copy_refresh"] = late_data_copy_refresh(attn, fx, ckpt)
             order["route_hit_after_final_process"] = (
                 metrics["route"]["new_route_calls"]["hits"] == 1
             )

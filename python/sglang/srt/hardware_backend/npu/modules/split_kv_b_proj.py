@@ -460,15 +460,16 @@ def finalize_split_kv_b_proj(model: object) -> int:
 
     ``post_load_weights`` runs at the end of the model's ``load_weights``,
     before the loader invokes ``quant_method.process_weights_after_loading`` on
-    each module.  A supported unquantized module is a no-op there, but if any
-    later stage replaces/moves the parameter, this final hook rebuilds Wk/Wv
-    from the true final weight instead of leaving a permanently stale state.
-    Returns the number of modules rebuilt.
+    each module.  This final hook unconditionally rebuilds every prepared
+    module from the current parameter, so a later stage that writes through
+    ``param.data.copy_`` (which does not bump ``_version``) or replaces/moves
+    the parameter cannot leave a permanently stale split.  Returns the number
+    of modules rebuilt.
     """
     rebuilt = 0
     for module in model.modules():
         state = getattr(module, _STATE_ATTR, None)
-        if state is None or _state_is_current(state, module):
+        if state is None:
             continue
         attn_view = SimpleNamespace(
             num_local_heads=state.num_heads,
