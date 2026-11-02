@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 from sglang.srt.hardware_backend.npu.modules import q_latent_rmsnorm_mxquant as qlm
 from sglang.srt.hardware_backend.npu.modules import deepseek_v2_attention_mla_npu as mha
+from sglang.srt.layers.linear import ColumnParallelLinear
 
 TREE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if TREE not in sys.path:
@@ -46,25 +47,59 @@ class FakeFusedOp:
 
 
 class FakeQuantMethod:
-    """Consumer contract: only the pre-quantised (values, scale) tuple."""
+    """Consumer stand-in usable inside a real ColumnParallelLinear."""
 
-    def __init__(self, out_features, out_dtype=torch.bfloat16):
-        self.out_features = out_features
-        self.out_dtype = out_dtype
-        self.calls = []
+    def __init__(self):
+        self.calls = []  # pre-quantised tuple calls
+        self.tensor_calls = []  # ordinary BF16 tensor calls via forward
         self.output = None
+        self.out_features = None
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype=None,
+        **kwargs,
+    ):
+        out = sum(output_partition_sizes)
+        weight = torch.empty(
+            (out, input_size_per_partition), dtype=torch.float8_e4m3fn
+        )
+        layer.weight = torch.nn.Parameter(
+            weight.transpose(0, 1), requires_grad=False
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.empty(
+                (input_size_per_partition // 64, out, 2), dtype=torch.uint8
+            ),
+            requires_grad=False,
+        )
+        layer._sgl_npu_mx_quant_fusable = True
+        layer.bias_fp32 = None
+        self.out_features = out
 
     def apply(self, layer, x, bias=None):
-        if not isinstance(x, tuple):
-            raise AssertionError(
-                "MXFP8 consumer received a tensor: would call DynamicMxQuant"
-            )
-        if len(x) != 2:
-            raise AssertionError(f"expected (values, scale), got {len(x)} tensors")
-        self.calls.append({"layer": layer, "x": x, "bias": bias})
-        rows = x[0].shape[0]
-        self.output = torch.zeros((rows, self.out_features), dtype=self.out_dtype)
+        if isinstance(x, tuple):
+            if len(x) != 2:
+                raise AssertionError(f"expected (values, scale), got {len(x)}")
+            self.calls.append({"layer": layer, "x": x, "bias": bias})
+            rows = x[0].shape[0]
+        else:
+            self.tensor_calls.append({"layer": layer, "x": x, "bias": bias})
+            rows = x.shape[0]
+        self.output = torch.zeros(
+            (rows, layer.output_size_per_partition), dtype=torch.bfloat16
+        )
         return self.output
+
+
+class FakeQuantConfig:
+    def get_quant_method(self, layer, prefix=""):
+        return FakeQuantMethod()
 
 
 class FakeNorm:
@@ -81,28 +116,36 @@ class FakeNorm:
         return torch.zeros_like(x)
 
 
-class FakeProj:
-    def __init__(self, out_features, in_features=768):
-        self.out_features = out_features
-        self.tp_size = 1
-        self.gather_output = False
-        self.skip_bias_add = False
-        self.bias = None
-        self._sgl_npu_mx_quant_fusable = True
-        self.weight = torch.empty(
-            (in_features, out_features), dtype=torch.float8_e4m3fn
-        )
-        self.weight_scale_inv = torch.empty((1, 1, 2), dtype=torch.uint8)
-        self.quant_method = FakeQuantMethod(out_features)
-        self.call_count = 0
+def make_plain_proj(
+    out_features=68,
+    in_features=768,
+    bias=False,
+    skip_bias_add=False,
+    gather_output=False,
+    tp_size=1,
+    cls=ColumnParallelLinear,
+):
+    """A real ColumnParallelLinear, the only surface the production gate allows."""
+    return cls(
+        in_features,
+        out_features,
+        bias=bias,
+        gather_output=gather_output,
+        skip_bias_add=skip_bias_add,
+        params_dtype=torch.bfloat16,
+        quant_config=FakeQuantConfig(),
+        tp_rank=0,
+        tp_size=tp_size,
+    )
 
-    def __call__(self, x):
-        self.call_count += 1
-        return torch.zeros((x.shape[0], self.out_features), dtype=torch.bfloat16), None
+
+def mutate_attr(obj, name, value):
+    """Bypass nn.Module's Parameter-only __setattr__ for test mutations."""
+    object.__setattr__(obj, name, value)
 
 
 def make_fakes(out_features=68, width=768):
-    return FakeNorm(width), FakeProj(out_features)
+    return FakeNorm(width), make_plain_proj(out_features, in_features=width)
 
 
 class HelperContractTest(unittest.TestCase):
@@ -130,7 +173,7 @@ class HelperContractTest(unittest.TestCase):
 
     def call(self, norm=None, proj=None, x=None, **kwargs):
         norm = norm if norm is not None else FakeNorm()
-        proj = proj if proj is not None else FakeProj(68)
+        proj = proj if proj is not None else make_plain_proj(68)
         if x is None:
             x = torch.zeros((4, 768), dtype=torch.bfloat16)
         return qlm.forward_q_latent_rmsnorm_mxquant(norm, proj, x, **kwargs)
@@ -255,11 +298,15 @@ class HelperContractTest(unittest.TestCase):
         )
 
         norm, proj = make_fakes()
-        proj.weight = SimpleNamespace(
-            dtype=torch.float8_e4m3fn,
-            device=SimpleNamespace(type="cpu", index=1),
-            dim=lambda: 2,
-            shape=(768, 68),
+        mutate_attr(
+            proj,
+            "weight",
+            SimpleNamespace(
+                dtype=torch.float8_e4m3fn,
+                device=SimpleNamespace(type="cpu", index=1),
+                dim=lambda: 2,
+                shape=(768, 68),
+            ),
         )
         self.assertEqual(
             qlm.fusion_blocker(norm, proj, x), "proj_device_mismatch"
@@ -319,6 +366,17 @@ class HelperContractTest(unittest.TestCase):
             lambda n, p, x: setattr(p, "gather_output", True) or x,
         )
         case(
+            "proj_bias",
+            lambda n, p, x: mutate_attr(
+                p, "bias", torch.zeros(68, dtype=torch.bfloat16)
+            )
+            or x,
+        )
+        case(
+            "proj_skip_bias_add",
+            lambda n, p, x: setattr(p, "skip_bias_add", True) or x,
+        )
+        case(
             "proj_forward_hook",
             lambda n, p, x: setattr(p, "_forward_hooks", {1: 0}) or x,
         )
@@ -336,21 +394,21 @@ class HelperContractTest(unittest.TestCase):
         )
         case(
             "weight_not_fp8",
-            lambda n, p, x: setattr(
+            lambda n, p, x: mutate_attr(
                 p, "weight", torch.empty((1, 1), dtype=torch.bfloat16)
             )
             or x,
         )
         case(
             "proj_width_mismatch",
-            lambda n, p, x: setattr(
+            lambda n, p, x: mutate_attr(
                 p, "weight", torch.empty((512, 68), dtype=torch.float8_e4m3fn)
             )
             or x,
         )
         case(
             "missing_weight_scale_inv",
-            lambda n, p, x: setattr(p, "weight_scale_inv", None) or x,
+            lambda n, p, x: mutate_attr(p, "weight_scale_inv", None) or x,
         )
 
         for name, (norm, proj, x) in cases.items():
@@ -359,9 +417,73 @@ class HelperContractTest(unittest.TestCase):
                 self.assertEqual(self.op.calls, [])
                 self.assertEqual(getattr(proj.quant_method, "calls", []), [])
 
+    def test_consumer_forward_semantics_fall_back_before_fused_execution(self):
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+
+        class PlainSubclass(ColumnParallelLinear):
+            pass
+
+        class ForwardOverrideSubclass(ColumnParallelLinear):
+            def forward(self, input_):
+                return torch.zeros((input_.shape[0], 68), dtype=torch.bfloat16), None
+
+        def instance_override(self, input_):
+            return torch.zeros((input_.shape[0], 68), dtype=torch.bfloat16), None
+
+        import types as _types
+
+        lora_like = SimpleNamespace(
+            tp_size=1,
+            gather_output=False,
+            skip_bias_add=False,
+            bias=None,
+            _sgl_npu_mx_quant_fusable=True,
+            weight=torch.empty((768, 68), dtype=torch.float8_e4m3fn),
+            weight_scale_inv=torch.empty((12, 68, 2), dtype=torch.uint8),
+            quant_method=FakeQuantMethod(),
+        )
+
+        cases = {}
+        cases["plain_subclass"] = make_plain_proj(cls=PlainSubclass)
+        cases["forward_override_subclass"] = make_plain_proj(
+            cls=ForwardOverrideSubclass
+        )
+        instance_proj = make_plain_proj()
+        instance_proj.forward = _types.MethodType(instance_override, instance_proj)
+        cases["instance_forward_override"] = instance_proj
+        cases["arbitrary_marker_object"] = lora_like
+        cases["biasful"] = make_plain_proj(bias=True)
+        cases["skip_bias_add"] = make_plain_proj(skip_bias_add=True)
+        parametrized = make_plain_proj()
+        parametrized.parametrizations = {"weight": object()}
+        cases["parametrized"] = parametrized
+
+        for name, proj in cases.items():
+            with self.subTest(name=name):
+                norm = FakeNorm()
+                self.assertIsNone(self.call(norm=norm, proj=proj, x=x))
+                self.assertEqual(self.op.calls, [])
+                if isinstance(proj, ColumnParallelLinear):
+                    self.assertEqual(proj.quant_method.calls, [])
+                    self.assertEqual(proj.quant_method.tensor_calls, [])
+                else:
+                    self.assertEqual(proj.quant_method.calls, [])
+
+    def test_plain_column_parallel_forward_equals_direct_consumer(self):
+        proj = make_plain_proj(68)
+        x = torch.zeros((4, 768), dtype=torch.bfloat16)
+        out_forward = proj(x)[0]
+        quant = torch.empty((4, 768), dtype=torch.float8_e4m3fn)
+        scale = torch.empty((4, 12, 2), dtype=torch.uint8)
+        out_direct = proj.quant_method.apply(proj, (quant, scale), None)
+        self.assertTrue(torch.equal(out_forward, out_direct))
+        self.assertEqual(len(proj.quant_method.tensor_calls), 1)
+        self.assertIsNone(proj.quant_method.tensor_calls[0]["bias"])
+        self.assertEqual(len(proj.quant_method.calls), 1)
+
     def test_supported_route_passes_original_gamma_epsilon_and_tuple(self):
         norm = FakeNorm(eps=1.25e-5)
-        proj = FakeProj(68)
+        proj = make_plain_proj(68)
         # Original qkv stride 1344, nonzero storage offset, q-latent slice.
         base = torch.randn((5, 1400), dtype=torch.bfloat16)
         qkv = base[:, 17 : 17 + 1344]
@@ -387,6 +509,7 @@ class HelperContractTest(unittest.TestCase):
         self.assertTrue(torch.equal(call["x"], x))
 
         self.assertEqual(len(proj.quant_method.calls), 1)
+        self.assertEqual(proj.quant_method.tensor_calls, [])
         (quant, scale) = proj.quant_method.calls[0]["x"]
         self.assertEqual(quant.dtype, torch.float8_e4m3fn)
         self.assertEqual(scale.dtype, torch.uint8)
@@ -559,9 +682,10 @@ class PrepareRouteContractTest(unittest.TestCase):
         v_head_dim=6,
     ):
         self.rows = rows
-        self.quant_method = FakeQuantMethod(qk_nope_head_dim + qk_rope_head_dim)
-        self.proj = FakeProj(qk_nope_head_dim + qk_rope_head_dim)
-        self.proj.quant_method = self.quant_method
+        self.proj = make_plain_proj(
+            qk_nope_head_dim + qk_rope_head_dim, in_features=q_lora_rank
+        )
+        self.quant_method = self.proj.quant_method
         self.norm = FakeNorm(q_lora_rank)
         self.qkv = torch.randn(
             (rows, q_lora_rank + kv_lora_rank + qk_rope_head_dim),
@@ -682,7 +806,7 @@ class PrepareRouteContractTest(unittest.TestCase):
         quant, scale = self.quant_method.calls[0]["x"]
         self.assertEqual(quant.dtype, torch.float8_e4m3fn)
         self.assertEqual(tuple(scale.shape), (self.rows, 12, 2))
-        self.assertEqual(self.proj.call_count, 0)  # no second quant path
+        self.assertEqual(len(self.quant_method.tensor_calls), 0)
         self.assertEqual(self.norm.call_count, 0)  # norm fused inside
 
         # BF16 projection output reaches the rest of the prepare function.
@@ -714,7 +838,7 @@ class PrepareRouteContractTest(unittest.TestCase):
         self.assertEqual(self.op.calls, [])
         self.assertEqual(self.quant_method.calls, [])
         self.assertEqual(self.norm.call_count, 1)
-        self.assertEqual(self.proj.call_count, 1)
+        self.assertEqual(len(self.quant_method.tensor_calls), 1)
 
     def test_dsa_keeps_bf16_norm_output_for_indexer(self):
         self.run_prepare(use_dsa=True)
@@ -730,7 +854,7 @@ class PrepareRouteContractTest(unittest.TestCase):
         self.run_prepare()
         self.assertEqual(self.op.calls, [])
         self.assertEqual(self.norm.call_count, 1)
-        self.assertEqual(self.proj.call_count, 1)
+        self.assertEqual(len(self.quant_method.tensor_calls), 1)
 
     def test_compile_and_capture_fall_back_in_real_route(self):
         qlm._compiler_is_compiling = lambda: True
@@ -770,7 +894,7 @@ class PrepareRouteContractTest(unittest.TestCase):
             self.scatter_modes,
         )
         self.assertEqual(self.norm.call_count, 1)
-        self.assertEqual(self.proj.call_count, 1)
+        self.assertEqual(len(self.quant_method.tensor_calls), 1)
         self.assertEqual(self.quant_method.calls, [])
 
 

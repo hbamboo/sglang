@@ -81,6 +81,35 @@ def _same_device(a, b) -> bool:
     return (a.type, a.index) == (b.type, b.index)
 
 
+def _consumer_forward_blocker(proj) -> Optional[str]:
+    """Only the plain ColumnParallelLinear forward may be bypassed.
+
+    Directly calling ``quant_method.apply`` is equivalent to
+    ``ColumnParallelLinear.forward`` only when the layer is that exact class,
+    has no per-instance/class forward override, is TP1, does not gather its
+    output, and has no bias/skip-bias behavior.  Resolved lazily and only after
+    the flag/compile/device/capture gates, so default-off startup pays nothing
+    and import cycles are avoided.
+    """
+    try:
+        from sglang.srt.layers.linear import ColumnParallelLinear
+    except Exception:
+        return "consumer_class_import_error"
+    if type(proj) is not ColumnParallelLinear:
+        return "proj_not_plain_column_parallel"
+    if "forward" in getattr(proj, "__dict__", {}):
+        return "proj_instance_forward_override"
+    if getattr(type(proj), "forward", None) is not ColumnParallelLinear.forward:
+        return "proj_forward_override"
+    if getattr(proj, "skip_bias_add", False):
+        return "proj_skip_bias_add"
+    if getattr(proj, "bias", None) is not None:
+        return "proj_bias"
+    if getattr(proj, "parametrizations", None):
+        return "proj_parametrized"
+    return None
+
+
 def _compiler_guard(is_compiling) -> Optional[str]:
     # Fail closed: an exception means we cannot prove the route is eager.
     try:
@@ -205,6 +234,9 @@ def fusion_blocker(
     # again; plain BF16/unquantised linears must stay on the original path.
     if not getattr(proj, "_sgl_npu_mx_quant_fusable", False):
         return "proj_not_mxfp8_fusable"
+    blocker = _consumer_forward_blocker(proj)
+    if blocker is not None:
+        return blocker
     quant_method = getattr(proj, "quant_method", None)
     if quant_method is None or not callable(getattr(quant_method, "apply", None)):
         return "proj_no_quant_apply"

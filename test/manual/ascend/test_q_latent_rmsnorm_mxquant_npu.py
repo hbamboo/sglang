@@ -82,7 +82,7 @@ _RUNTIME = {}
 
 def _load_runtime():
     """Import torch_npu/sglang only after an explicit NPU grant."""
-    global torch_npu, qlm, mha, NPUMXFP8LinearMethod, RMSNorm, _RUNTIME
+    global torch_npu, qlm, mha, NPUMXFP8LinearMethod, RMSNorm, ColumnParallelLinear, _RUNTIME
     import torch_npu as _torch_npu
 
     import sglang.srt.layers.quantization  # noqa: F401
@@ -96,14 +96,21 @@ def _load_runtime():
         NPUMXFP8LinearMethod as _kernel,
     )
     from sglang.srt.layers.layernorm import RMSNorm as _rmsnorm
+    from sglang.srt.layers.linear import ColumnParallelLinear as _cpl
 
     torch_npu = _torch_npu
     qlm = _qlm
     mha = _mha
     NPUMXFP8LinearMethod = _kernel
     RMSNorm = _rmsnorm
+    ColumnParallelLinear = _cpl
     _RUNTIME.update(
-        torch_npu=_torch_npu, qlm=_qlm, mha=_mha, kernel=_kernel, rmsnorm=_rmsnorm
+        torch_npu=_torch_npu,
+        qlm=_qlm,
+        mha=_mha,
+        kernel=_kernel,
+        rmsnorm=_rmsnorm,
+        column_parallel=_cpl,
     )
 
 
@@ -430,37 +437,44 @@ def make_norm(width, gamma, eps, device):
     return norm
 
 
-class _LinearAdapter:
-    """ColumnParallelLinear-compatible surface for the real MXFP8 kernel."""
+class _NPUQuantConfig:
+    """Quant config that returns the real online MXFP8 linear method."""
 
-    def __init__(self, weight, kernel):
-        self.weight = torch.nn.Parameter(weight, requires_grad=False)
-        self.bias = None
-        self.quant_method = kernel
-        self._mx_kernel = kernel
-        self.tp_size = 1
-        self.gather_output = False
-        self.skip_bias_add = False
-        self._sgl_npu_mx_quant_fusable = True
-
-    def __call__(self, x):
-        return self.quant_method.apply(self, x, None), None
+    def get_quant_method(self, layer, prefix=""):
+        return NPUMXFP8LinearMethod()
 
 
 def make_layer(out_features, seed, device):
+    """Construct the real plain TP1, bias-free ColumnParallelLinear q_b_proj."""
+    layer = ColumnParallelLinear(
+        Q_LORA,
+        out_features,
+        bias=False,
+        gather_output=False,
+        skip_bias_add=False,
+        params_dtype=torch.bfloat16,
+        quant_config=_NPUQuantConfig(),
+        tp_rank=0,
+        tp_size=1,
+    )
+    layer.to(device)
     g = torch.Generator().manual_seed(seed + 17)
     weight = (
         torch.randn((out_features, Q_LORA), generator=g)
         .to(torch.bfloat16)
         .to(device)
     )
-    layer = _LinearAdapter(weight, None)
-    kernel = NPUMXFP8LinearMethod()
-    kernel.process_weights_after_loading(layer)
+    with torch.no_grad():
+        layer.weight.data.copy_(weight)
+    layer.quant_method.process_weights_after_loading(layer)
     if not getattr(layer, "_sgl_npu_mx_quant_fusable", False):
         raise AssertionError("NPUMXFP8LinearMethod did not set the fusable contract")
-    layer.quant_method = kernel
-    layer._mx_kernel = kernel
+    if type(layer) is not ColumnParallelLinear:
+        raise AssertionError("NPU harness consumer is not the plain class")
+    if "forward" in layer.__dict__:
+        raise AssertionError("NPU harness consumer has an instance forward override")
+    if type(layer).forward is not ColumnParallelLinear.forward:
+        raise AssertionError("NPU harness consumer forward override")
     return layer
 
 
@@ -582,8 +596,10 @@ def run_case(rows, seed, eps, device, layout="stride1344_offset", offset=64,
         q_old, scale_old = torch.ops.npu.npu_dynamic_mx_quant(
             q_norm, dst_type=torch.float8_e4m3fn
         )
-        out_old = layer._mx_kernel.apply(layer, q_norm, None)
-        out_old_tuple = layer._mx_kernel.apply(layer, (q_old, scale_old), None)
+        out_old = layer(q_norm)[0]
+        out_old_tuple = layer.quant_method.apply(
+            layer, (q_old, scale_old), None
+        )
         _sync()
 
         # New path: helper without injected gate overrides (real capture query).
@@ -648,9 +664,11 @@ def run_case(rows, seed, eps, device, layout="stride1344_offset", offset=64,
         meta["q_old_finite"] = _finite_stats(q_old)
         check(meta["q_old_finite"]["bad"] == 0, "q_old_nonfinite")
 
-        # Old tensor path vs old pre-quantised tuple path: bitwise equal.
+        # Plain TP1 ColumnParallelLinear.forward vs the direct tuple consumer:
+        # bitwise equal (no gather/bias/SP branch).
         old_tuple = byte_match(out_old, out_old_tuple)
         meta["old_tensor_vs_old_tuple"] = old_tuple
+        meta["forward_vs_direct_tuple"] = old_tuple
         if old_tuple["mismatch"] != CRITERIA["old_tensor_vs_old_tuple"]["mismatch"]:
             failures.append("old_tensor_vs_old_tuple_not_bitwise")
 
@@ -1025,7 +1043,7 @@ def time_prepare_alternating(rows, seed, eps, device, warmup, iters,
 def _chain_kernel_old(qkv, norm, layer):
     q = qkv.split([Q_LORA, QKV_WIDTH - Q_LORA], dim=-1)[0]
     q_norm = norm(q)
-    out = layer._mx_kernel.apply(layer, q_norm, None)
+    out = layer(q_norm)[0]
     return out.view(-1, OUT_FEATURES)
 
 
