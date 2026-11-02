@@ -1,184 +1,80 @@
-# Ascend HiCache on the qualified r97 release
+# Ascend HiCache：PD 三条 prefill 路径
 
-This work starts at SGLang commit
-`bba2139690fc499ce7b39e18bfd4222f2a8051bd`, branch
-`release/codex-1031-best-r97-20261102`. Development uses the separate worktree
-`/sgl-workspace/sglang-hicache`, branch `opt/codex-1031-hicache`.
-The original worktree, release refs, packaged wheels and published image remain
-unchanged. No new operator binary is required.
+基于 `release/codex-1031-best-r97-20261102` 的 `bba2139690fc499ce7b39e18bfd4222f2a8051bd` 开发。
+工作区 `/sgl-workspace/sglang-hicache`，分支 `opt/codex-1031-hicache`。
+原工作区、release 引用、算子包、已发布镜像均未替换。
 
-## What changed
+## 实现
 
-Ascend already had HiCache configuration resolution and an all-layer native
-transfer operation. The release's host-pool paths no longer matched every
-physical device layout.
+MHA 修复 FIA 逐层列表、非对称 K/V 和主机层轴引用；MLA 使用 NPU 专用 HostPool，避免访问 CUDA 指针数组，避免把统一576维缓存中的非连续512/64视图当成连续内存。
 
-For MLA, backup entered CUDA pointer-array code before reaching the Ascend
-branch. Unified FlashMLA stores latent and RoPE in one contiguous tensor, while
-its 512/64-wide K/V views are non-contiguous. The native copy operation computes
-pitches from shape products, so copying those views as dense tensors is wrong.
-The old host layout also omitted indexer memory from its budget and lacked a
-complete storage-page interface.
+按用户指定，expanded 模式主机保存双份：compact latent/RoPE（及存在时的 indexer）继续供 PD 传输，expanded K/V 供 P 侧直接回载。没有回载后的重投影，没有新增 attention 量化。默认路径没有 expanded pool，仍只保存 compact，并执行该路径原有计算。未提交的重投影草稿已归档到证据目录 `draft-reproject`，不属于交付代码。
 
-The Ascend MLA host pool copies a unified buffer as one component, or copies
-legacy latent/RoPE components individually. Optional indexer data is another
-component. Each host page is one contiguous payload holding all its components,
-including every local layer. Its flat page and zero-copy metadata describe the
-same bytes. Empty V arguments are five-dimensional because the existing native
-operator reads the fifth dimension even when V has zero elements.
+每个 host page 是包含全部本地层、全部组件的连续 payload。compact 沿用 native 全层复制；expanded 每层独立分配，逐层调用原生 K/V pair copy，不能 stack 或假设层间连续。预算、flat page、pointer/size、文件序列化都包含完整双份数据。
 
-For MHA, FIA exposes per-layer list views to graph execution. The transfer path
-recovers the original five-dimensional allocation without copying, after
-checking shared storage, order and strides. Both equal and unequal K/V widths
-use this path. Host page-first layer references now use the correct axis.
+H2D stream 提交全部复制后才记录完成事件。`get_prefill_expanded_kv` 独立等待对应层事件；不借用 compact getter 的等待。CPU 确定性回归及 expanded-first 硬件测试覆盖这个顺序。
 
-Existing transfer streams, start fences and layer completion events are reused.
-Ascend's operation enqueues all local layers before recording layer-0 completion;
-this preserves correctness while allowing the normal consumer-stream waits.
+当前 dense GLM 每层每 token 的 compact 宽度576，expanded宽度 `20×(256+256)=10240`，双份10816元素，约18.8倍于 compact。BF16为21632 bytes。`--hicache-size`、比例容量与主机预算均计入双份；没有把额外数据藏在预算外。
 
-Service validation also exposed an eager FlashMLA short-context bug: metadata
-rounded a 129-token context up to512 while its block table held only256 tokens.
-The eager upper bound is now capped by the table capacity, and the same bound
-is used for metadata and execution. Graph mode keeps its dynamic `-1` behavior.
-This fix changes no attention arithmetic and introduces no tensor-value read.
+## P 侧配置
 
-## Enabling it
+P 启用 `--enable-hierarchical-cache`。本轮为 `--hicache-ratio 4 --hicache-write-policy write_through`。
 
-Use this worktree's Python source, rather than the published image's source:
+| 路径 | `PREFILL_EXPANDED_KV` | `PREFILL_FUSED_KV_SCATTER` | `PREFILL_FAS` | `PREFILL_FAS_EXTENDED_SHAPES` |
+|---|---:|---:|---:|---:|
+| 默认 | 0 | 0 | 0 | 0 |
+| expanded | 1 | 1 | 0 | 0 |
+| FAS | 1 | 1 | 1 | 1 |
 
-```bash
-export PYTHONPATH=/sgl-workspace/sglang-hicache/python${PYTHONPATH:+:$PYTHONPATH}
-export SGLANG_NPU_PREFILL_EXPANDED_KV=0
-```
+表中开关全名都加 `SGLANG_NPU_` 前缀。FAS 依赖 expanded pool；单开 FAS 而关闭 expanded 不代表命中。FAS 保留 batch、dtype、layout、prefix、token 数 guard，不满足时正常 fallback。
 
-Add these options to the existing Ascend launch command:
+P 使用 unified latent、FlashMLA关闭；D 使用之前已验证的 unified+FlashMLA。此次验收关注 P。Ascend 自动解析 IO 为 `kernel_ascend`，MLA host layout 为 `page_first_kv_split`，MHA为 `page_first_direct`。
 
-```bash
---enable-hierarchical-cache \
---hicache-ratio 2 \
---hicache-write-policy write_through
-```
+运行新功能需切换到本工作区源码，并同步更新启动脚本固定 commit 校验。原 `r97_script` 仍引用旧冻结源码，逐角色开关也可能覆盖外层 export；本轮没有替换用户已有脚本。FAS 还必须满足实际 shape guard。
 
-Ascend resolves `hicache_io_backend=kernel_ascend`; MLA uses
-`page_first_kv_split`, MHA uses `page_first_direct`. Unified MLA remains controlled
-by the existing `ENABLE_ASCEND_FLASH_MLA` / `SGLANG_NPU_MLA_UNIFIED_KV` switches.
-Choose host capacity for all colocated ranks. A fixed `--hicache-size` remains
-supported and includes the MLA indexer allocation.
+## 文件后端
 
-For a server that decodes with unified MLA KV, enable
-`ENABLE_ASCEND_FLASH_MLA=1` and retain the qualified FlashMLA OPP/library paths.
-Enabling only `SGLANG_NPU_MLA_UNIFIED_KV=1` while decoding through FIA is not a
-supported combination: FIA rejects the unified buffer's strided RoPE view.
-The layout-only switch remains useful for prefill workers whose decode peer
-uses FlashMLA.
+MLA L3 当前开放 `file`：`--hicache-storage-backend file`，目录由 `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` 指定。其他 MLA L3 后端在加载前拒绝。
 
-The old best-r97 P-worker script explicitly enables expanded prefill KV.
-Change that worker environment setting to `0` when enabling HiCache; an outer
-export is insufficient if the launch script overrides it. Expanded prefill KV
-is a separate derived cache and is not restored by this implementation.
+Namespace 自动区分 split/unified、dtype、page、层范围、latent/RoPE/index维度、expanded几何及ND/NZ相关开关。开关在初始化时冻结。等长不同格式不串读，同格式不同容量可复用；startup/runtime attach共用校验且不修改原配置。双份 file round trip 做了真实文件逐字节CPU验证，未做真实PD L3压测。
 
-For persistent MLA caching, the verified backend is `file`:
+## 功能验收
 
-```bash
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/path/to/hicache
-# Also add: --hicache-storage-backend file
-```
+硬件为 Ascend950DT，P7/D6各TP1。服务使用 eager、关闭调度重叠，未验收图模式或多P/D拓扑。测试模型为固定随机权重的2层BF16模型：20头、latent512、QK192+64、V256，与目标GLM核心attention几何相同，但hidden320/vocab1024，不是生产47层MXFP8模型。所有输入为合成token IDs。
 
-A versioned format fingerprint is automatically added to the storage namespace.
-It distinguishes unified/split ordering, dtype, page size, layer range and each
-component's dimensions. Equal byte length does not imply equal serialization.
-Old cache pages therefore miss safely, while matching formats can reuse pages
-across different pool capacities. Configuration objects are copied, and runtime
-storage attachment uses the same checks as startup.
+每case独立启动并检查P/D均注册且健康：cold golden四prompt各生成2token→标准P/D flush成功并settle1秒→四条257token seed留下256前缀→九条4096token不同前缀驱逐设备缓存→四条target要求每条host256/device0及两token与本case golden相同。
 
-Other MLA L3 backends fail before loading their modules. DCP, layer-sharded
-pools, packed MTP and HiSparse are outside this implementation's supported
-combinations. The existing CUDA/HIP host-pool classes remain selected for their
-devices. NPU PD direct-to-host offload is a different transfer ABI and is not
-qualified by these tests.
+默认/expanded target为256 prefix+2048 new。PD实际拆成1+3批，因此FAS专属case使用256+4096，保持guard原样。实际后3条组成batch3/new12288并执行FAS，首条走原FIA fallback。形状不同，只比较各case自身cold/回载结果，不作跨case性能AB。
 
-## Validation
+| 路径 | 有效结果 | 实际路径证据 |
+|---|---|---|
+| 默认 | 21逻辑请求成功；4target host256/device0、两token一致 | PD传输与loadback |
+| expanded（补fence后） | 同上 | actual expanded分支及dual mirror H2D |
+| FAS（补fence后） | 同上 | 算子返回后记录batch3/new12288/prefix256，生产guard复核 |
 
-Run CPU regressions without automatic accelerator backend loading:
+默认路径结果来自 `4db0619`。之后到生产代码冻结点 `20bcb8b`，唯一生产变更是 expanded getter 的等待；默认路径关闭 expanded，不调用该 getter，因此保留已通过结果。expanded、FAS 均在补等待后重测通过，未把此前结果冒充重测。
 
-```bash
-cd /sgl-workspace/sglang-hicache
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONPATH=python python3 test/manual/ascend/test_hicache_mha_cpu.py
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONPATH=python python3 test/registered/unit/mem_cache/test_npu_hicache_mla.py
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONPATH=python python3 test/registered/unit/mem_cache/test_npu_hicache_storage.py
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONPATH=python python3 test/manual/ascend/test_flash_mla_short_table_cpu.py
-```
+不能将 `first eligible eager step` 当成实际FAS执行；新counter/日志只在真实算子返回后增加。FAS覆盖3条target，不宣称4条全部或全部业务100%命中。
 
-MHA has eight CPU regressions. MLA has nine, including twelve dtype/layout/index
-round-trip combinations and exact native-pitch address simulation. File storage
-has seven, including real file IO, complete data round trips and format
-isolation. Existing DCP host-pool and staged write-back tests contribute 25
-passes and one existing skip; this does not imply Ascend DCP support.
-Six additional FlashMLA regressions cover short tables, bucket boundaries,
-graph behavior and padded output. The original method fails the four short-table
-cases; the fixed method passes all six. The CPU total is55 passes and one skip.
+DMA位级比较通过；服务token一致不代表logits位级一致。默认/expanded最大logprob差约 `5.197525e-5`，FAS约 `0.007791519`。这些结果不替代生产整网精度评测。
 
-Run actual DMA and stream/event tests on one free NPU:
+CPU累计85项通过、1项原条件skip：MHA8、MLA9、file8、DCP host10、staged write-back15、FlashMLA短表6、原FAS contract10、新FAS dispatcher7、dual7、expanded fence5。DCP项是原通用代码回归，不表示NPU新增DCP支持；重投影和旧hook草稿不计入。
 
-```bash
-ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=python python3 test/registered/npu/basic_function/HiCache/test_npu_hicache_transfer.py
-ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=python python3 test/registered/npu/basic_function/HiCache/test_npu_hicache_mha_transfer.py
-```
+实际NPU矩阵：MHA8、MLA8、dual4种组合。dual4在补fence后改为先读取expanded，再读取所有compact getter，重新通过。包含BF16/FP16、独立逐层分配、乱序页面、换页回载、未选页、完整序列化及完成事件。
 
-Both actual-NPU matrices passed on Ascend950DT: eight MLA combinations and eight
-MHA combinations. They cover BF16/FP16, three layers, 128-token pages, permuted
-non-adjacent pages, restoration into different slots, untouched-page sentinels
-and consumer access through per-layer events. These are correctness tests,
-not kernel performance or serving-QPS measurements.
+最终验收选用的目录：
 
-Detailed logs, service-smoke harness/results and ownership/cleanup evidence are
-stored outside the repository at
-`/mnt/sfs_turbo/hxd/p_kv_shared_tune_test/codex-1031/hicache-20261102`.
+- 默认：`pd-three-paths/pd-default-20261102-194024`
+- expanded：`pd-three-paths/post-fence/pd-expanded-20261102-200831`
+- FAS：`pd-three-paths/post-fence/pd-fas-20261102-201032`
 
-The service tests ran in eager mode with graph execution and schedule overlap
-disabled; they do not qualify graph/overlap execution or a multi-worker PD
-topology. The service smoke test deliberately fills the device cache with other prefixes,
-then requests the original synthetic 384-token prompt again. A pass requires
-256 cached host tokens, zero cached device tokens, matching cold/load-back
-output token IDs, successful requests and complete owned-process cleanup.
-The final synthetic model uses the target GLM attention geometry: 20 heads,
-latent width512, QK width192+64 and V width256. It has only two random-weight
-layers, hidden size320 and vocabulary1024; this is not a production-model
-accuracy or throughput evaluation. Logprob differences are recorded separately
-from output-token equality.
+证据根目录：`/mnt/sfs_turbo/hxd/p_kv_shared_tune_test/codex-1031/hicache-20261102`。
+聚合：`pd-three-paths/pd-service-agent-summary-post-fence.json`；报告：`pd-three-paths/post-fence/PD-POST-FENCE-VALIDATION.md`。所有旧失败/pre-fence结果保留。P/D通过后owner停止超时再SIGKILL，与运行crash分开记录；全部自建组清空、卡6/7释放。
 
-The split service passed seven requests with host256/device0 on reload and
-matching output token985; the cold/reload logprob difference was
-`7.62939453125e-6`. The final unified+FlashMLA service, after the short-table fix,
-passed complete warmup and seven two-token requests. Cold and host-reloaded
-outputs were both `[985, 985]`; logprob differences were
-`[7.62939453125e-6, 1.7642974853515625e-5]`. It covers actual decode continuation
-after host reload. All owned processes exited and card7 was verified idle.
-Raw DMA checks are byte-exact; these service logprobs are not claimed bit-exact.
+## 范围与原镜像
 
-Final directories under the evidence root are
-`service-host-evict-split-20261102-182747` and
-`service-host-evict-unified-flashmla-out2-20261102-184143`.
+DCP、layer sharding、packed MTP、HiSparse、PD offload-only未在本轮支持或验收。旧QK192/V128小模型的ATB RingMLA前缀错误，在无HiCache对照同样复现，未在本次修改。unified decode经FIA读strided RoPE也不支持，应保留FlashMLA。另单独修复了eager FlashMLA短上下文bucket超出block-table容量，graph动态 `-1` 不变。
 
-An earlier DeepSeek-style small model with QK192/V128 failed in the inherited
-ATB RingMLA prefix-attention path. A control test with HiCache disabled and an
-ordinary device-prefix hit failed at the same operation. That attention-kernel
-limitation was not changed here. It must not be represented as a successful
-service test or confused with the passing raw-DMA matrices.
+本轮没有生产QPS benchmark，没有恢复暂停的11QPS优化任务，没有生产47层MXFP8整网精度结论。
 
-## Published image provenance
-
-`sglang:codex-1031-best-r97-20261102`, image ID
-`sha256:0e87d41c14db6b258376dafc160ec71345bb636abe5ffeb017f9d3e8f4ddb8f1`,
-was built before the release branch was created. Its labels record framework
-baseline `73a2cbb65555d303c1836411edfe7dd9400eaa82` and operator source
-`79ab3b050e7a9109eea593ce4d4bf491f1e66df6`, plus the packaged working-tree
-changes subsequently committed separately. The release freeze verified the
-same 4679 tracked framework runtime paths and one generated version file.
-Thus the image's runtime contents match the release freeze, but it was not
-built by checking out that release branch. It contains none of these new
-HiCache commits. Its internal scripts still use the qualified client port9020;
-the separately delivered `r97_script` uses client port9001.
-
-The image's earlier 10.7342 QPS/card and mean E2E1445.54ms are not HiCache
-performance results. No HiCache throughput improvement is claimed here.
+原镜像 `sglang:codex-1031-best-r97-20261102`、ID `sha256:0e87d41c14db6b258376dafc160ec71345bb636abe5ffeb017f9d3e8f4ddb8f1` 先构建，再固化同运行内容到release；不是checkout该release分支后直接打的。冻结核对4679 tracked runtime路径+1 generated version内容一致。镜像未包含此次HiCache提交，本轮未重打或改内部脚本；旧10.7342 QPS/card、E2E1445.54ms不是HiCache收益。
