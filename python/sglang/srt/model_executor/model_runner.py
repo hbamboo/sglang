@@ -1173,6 +1173,22 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        if str(self.device).startswith("npu"):
+            # Final after-load hook: post_load_weights prepares static split
+            # KV-B buffers inside model.load_weights, before loader/quantizer
+            # post-processing. Rebuild only if a later stage changed the
+            # parameter, so a supported layer never stays permanently stale.
+            from sglang.srt.hardware_backend.npu.modules.split_kv_b_proj import (
+                finalize_split_kv_b_proj,
+            )
+
+            refreshed = finalize_split_kv_b_proj(self.model)
+            if refreshed:
+                logger.info(
+                    "SGLANG_NPU_SPLIT_KV_B_PROJ: refreshed %d layer(s) after "
+                    "final model load",
+                    refreshed,
+                )
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (

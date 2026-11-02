@@ -757,6 +757,9 @@ class Envs:
     SGLANG_NPU_PREFILL_EXPANDED_KV = EnvBool(True)
     # Fuse packed MLA K/V assembly and paged writes; requires updated sgl-kernel-npu.
     SGLANG_NPU_PREFILL_FUSED_KV_SCATTER = EnvBool(True)
+    # Opt-in: statically split kv_b_proj into per-head K_nope/V matrices for the
+    # current-token NPU MHA prepare. Off by default; unquantized BF16/FP16 only.
+    SGLANG_NPU_SPLIT_KV_B_PROJ = EnvBool(False)
     # Eager FAS candidate for guarded large expanded PD-prefill batches.
     SGLANG_NPU_PREFILL_FAS = EnvBool(False)
     SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES = EnvBool(False)

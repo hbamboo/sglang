@@ -5,15 +5,27 @@ import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.mha_rope_cache import (
+    get_mha_rope_cos_sin,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
     is_mla_preprocess_for_batch,
 )
+from sglang.srt.hardware_backend.npu.modules.kv_rmsnorm_unified_cache_npu import (
+    maybe_unified_kv_rmsnorm_rope_cache,
+)
 from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     PackedExpandedKV,
     can_fuse_expanded_kv,
     forward_expanded_prefill,
+)
+from sglang.srt.hardware_backend.npu.modules.q_latent_rmsnorm_mxquant import (
+    forward_q_latent_rmsnorm_mxquant,
+)
+from sglang.srt.hardware_backend.npu.modules.split_kv_b_proj import (
+    maybe_forward_split_kv_b_proj,
 )
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
@@ -66,15 +78,32 @@ def forward_mha_prepare_npu(
             )
 
         else:
-            q = m.q_a_layernorm(q)
-            if (
+            q_latent_all_gather = (
                 _use_ag_after_qlora
                 and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
                 and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-            ):
-                q = scattered_to_tp_attn_full(q, forward_batch)
-                latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
-            q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            )
+            # Narrow opt-in: fuse only RMSNorm + activation DynamicMxQuant and
+            # hand q_b_proj its pre-quantised tuple.  None means "unsupported",
+            # in which case the original BF16 norm path below runs unchanged.
+            q_b_fused = (
+                None
+                if q_latent_all_gather
+                else forward_q_latent_rmsnorm_mxquant(
+                    m.q_a_layernorm, m.q_b_proj, q
+                )
+            )
+            if q_b_fused is None:
+                q = m.q_a_layernorm(q)
+                if q_latent_all_gather:
+                    q = scattered_to_tp_attn_full(q, forward_batch)
+                    latent_cache = scattered_to_tp_attn_full(
+                        latent_cache, forward_batch
+                    )
+                q = m.q_b_proj(q)[0]
+            else:
+                q = q_b_fused
+            q = q.view(-1, m.num_local_heads, m.qk_head_dim)
 
     else:
         q = m.q_proj(hidden_states)[0].view(-1, m.num_local_heads, m.qk_head_dim)
@@ -86,10 +115,13 @@ def forward_mha_prepare_npu(
 
     if m.use_deepseek_yarn_rope:
         B, S = q.shape[0], 1
-        cos, sin = m.rotary_emb.get_cos_sin_cache(
+        cos, sin = get_mha_rope_cos_sin(
             # Input-norm fusion can pass (FP8 values, scales). The Q projection
             # still emits the original BF16 attention dtype, not FP8.
-            positions, q.dtype, offsets=None
+            m.rotary_emb,
+            positions,
+            q.dtype,
+            forward_batch,
         )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
@@ -98,23 +130,39 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
-        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-            latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
-            m.kv_a_layernorm.weight,
+        # Narrow opt-in (default off): write the real unified 576-wide cache
+        # layer view directly, touching only the mapped slots.  Unsupported
+        # modes (PA_NZ, quantized dtypes, non-unified pools, graph capture,
+        # torch.compile) return None and keep the original route below.
+        unified_out = maybe_unified_kv_rmsnorm_rope_cache(
+            m,
+            latent_cache,
             cos,
             sin,
-            forward_batch.out_cache_loc.to(torch.int64),
-            k_rope_cache,
-            ckv_cache,
-            k_rope_scale=None,
-            c_kv_scale=None,
-            k_rope_offset=None,
-            c_kv_offset=None,
-            epsilon=m.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
-            is_output_kv=True,
-        )  # adapter NZ
+            forward_batch.out_cache_loc,
+            get_token_to_kv_pool(),
+            is_fia_nz(),
+        )
+        if unified_out is not None:
+            k_pe, kv_a = unified_out
+        else:
+            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
+                m.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=None,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=m.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                is_output_kv=True,
+            )  # adapter NZ
 
         k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
     else:
@@ -129,14 +177,20 @@ def forward_mha_prepare_npu(
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
-    kv = m.kv_b_proj(kv_a)[0]
-    kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
-    if not m.use_dsa and can_fuse_expanded_kv(
-        get_token_to_kv_pool(), forward_batch, kv, k_pe
-    ):
-        return q, PackedExpandedKV(kv, k_pe, m.qk_nope_head_dim), None, forward_batch
-    k_nope = kv[..., : m.qk_nope_head_dim]
-    v = kv[..., m.qk_nope_head_dim :].contiguous()
+    split_kv = maybe_forward_split_kv_b_proj(m, m.kv_b_proj, kv_a, forward_batch)
+    if split_kv is not None:
+        # Opt-in split projection: physically contiguous per-head K_nope/V.
+        # The expanded-KV packed layout is intentionally not produced here.
+        k_nope, v = split_kv
+    else:
+        kv = m.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
+        if not m.use_dsa and can_fuse_expanded_kv(
+            get_token_to_kv_pool(), forward_batch, kv, k_pe
+        ):
+            return q, PackedExpandedKV(kv, k_pe, m.qk_nope_head_dim), None, forward_batch
+        k_nope = kv[..., : m.qk_nope_head_dim]
+        v = kv[..., m.qk_nope_head_dim :].contiguous()
 
     k = m._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
     return q, k, v, forward_batch

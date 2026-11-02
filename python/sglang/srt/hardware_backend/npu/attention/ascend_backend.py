@@ -407,6 +407,13 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        # Opt-in: let the eager BSND prefill loops write each request's FIA
+        # result straight into the preallocated attention output.  Cached at
+        # init so a later env change cannot desynchronise eager/graph routes;
+        # the default keeps the original result-then-assign (copying) path.
+        self.fia_direct_output = get_bool_env_var(
+            "SGLANG_NPU_FIA_DIRECT_OUTPUT", "False"
+        )
         self.use_flash_attn = False
         if get_bool_env_var("ENABLE_ASCEND_FLASH_ATTN", "False"):
             reason = fa_adapter.unsupported_reason(
@@ -576,6 +583,65 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
+
+    def _can_use_fia_direct_output(self, q: torch.Tensor) -> bool:
+        """Whether the eager BSND prefill loops may use the FIA ``.out`` form.
+
+        The flag is cached in ``__init__``.  Graph capture/replay and
+        torch.compile stay on the original default-op route: the output tensor
+        list is rebuilt for every request and has not been exercised under
+        either mode.  Only the dtypes/kernels validated for this route are
+        claimed; anything else keeps the old behaviour.
+        """
+        return (
+            self.fia_direct_output
+            and not self.graph_mode
+            and not self.enable_torch_compile
+            and q.device.type == "npu"
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and not torch.compiler.is_compiling()
+            and not torch.npu.is_current_stream_capturing()
+        )
+
+    @staticmethod
+    def _fia_bsnd_prefill_out(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor,
+        atten_mask: Optional[torch.Tensor],
+        sparse_mode: int,
+        scale: float,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> None:
+        """Run one FIA BSND request writing directly into ``out``.
+
+        ``out`` has shape ``[1, q_len, num_heads, v_head_dim]`` and may be a
+        view with a nonzero storage offset (contiguous element layout), which
+        lets the per-request result land in its final token slice.  The
+        softmax_lse output is required by the ``.out`` signature but unused
+        here (``softmax_lse_flag`` stays false), so it is a one-element
+        scratch tensor.  No explicit workspace is passed: the installed
+        schema makes the workspace optional and the operator allocates it
+        internally, which also keeps the extra ``get_max_workspace`` call and
+        its allocation out of the per-request hot path.  Profiling shows the
+        kernel writes the destination directly (no TensorMove/InplaceCopy).
+        """
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        torch_npu.npu_fused_infer_attention_score.out(
+            query,
+            key,
+            value,
+            num_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            input_layout="BSND",
+            atten_mask=atten_mask,
+            sparse_mode=sparse_mode,
+            scale=scale,
+            next_tokens=0,
+            out=[out, softmax_lse],
+        )
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -2222,12 +2288,18 @@ class AscendAttnBackend(AttentionBackend):
                     device=q.device,
                     dtype=q.dtype,
                 )
+                fia_direct = self._can_use_fia_direct_output(q)
                 q_len_offset = 0
                 prefix_len_offset = 0
                 for q_len, prefix_len in zip(
                     self.forward_metadata.extend_seq_lens_cpu_int,
                     self.forward_metadata.prefix_lens,
                 ):
+                    if q_len == 0:
+                        # No query tokens to submit; keep the prefix cursor in
+                        # step and leave the (empty) output slice untouched.
+                        prefix_len_offset += prefix_len
+                        continue
                     k_cur_slice = k[None, q_len_offset : q_len_offset + q_len]
                     v_cur_slice = v[None, q_len_offset : q_len_offset + q_len]
                     k_pre_slice = k_pre[
@@ -2240,20 +2312,35 @@ class AscendAttnBackend(AttentionBackend):
                     k_full = torch.cat([k_pre_slice, k_cur_slice], dim=1)
                     v_full = torch.cat([v_pre_slice, v_cur_slice], dim=1)
 
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
+                    if fia_direct:
+                        self._fia_bsnd_prefill_out(
                             q[None, q_len_offset : q_len_offset + q_len],
                             k_full,
                             v_full,
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask,
-                            sparse_mode=3,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
-                    )
+                            attn_output[
+                                q_len_offset : q_len_offset + q_len
+                            ].unsqueeze(0),
+                            self.fia_mask,
+                            3,
+                            layer.scaling,
+                            layer.tp_q_head_num,
+                            layer.tp_k_head_num,
+                        )
+                    else:
+                        attn_output[q_len_offset : q_len_offset + q_len] = (
+                            torch.ops.npu.npu_fused_infer_attention_score(
+                                q[None, q_len_offset : q_len_offset + q_len],
+                                k_full,
+                                v_full,
+                                num_heads=layer.tp_q_head_num,
+                                num_key_value_heads=layer.tp_k_head_num,
+                                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                                atten_mask=self.fia_mask,
+                                sparse_mode=3,
+                                scale=layer.scaling,
+                                next_tokens=0,
+                            )[0]
+                        )
                     q_len_offset += q_len
                     prefix_len_offset += prefix_len
                 attn_output = attn_output.view(
@@ -2372,22 +2459,42 @@ class AscendAttnBackend(AttentionBackend):
                     device=q.device,
                     dtype=q.dtype,
                 )
+                fia_direct = self._can_use_fia_direct_output(q)
                 q_len_offset = 0
                 for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
+                    if q_len == 0:
+                        # Empty request: do not submit an invalid zero-token
+                        # FIA call and do not touch neighbouring token slices.
+                        continue
+                    if fia_direct:
+                        self._fia_bsnd_prefill_out(
                             q[None, q_len_offset : q_len_offset + q_len],
                             k[None, q_len_offset : q_len_offset + q_len],
                             v[None, q_len_offset : q_len_offset + q_len].contiguous(),
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
-                    )
+                            attn_output[
+                                q_len_offset : q_len_offset + q_len
+                            ].unsqueeze(0),
+                            self.fia_mask.unsqueeze(0),
+                            3 if q_len != 1 else 0,
+                            layer.scaling,
+                            layer.tp_q_head_num,
+                            layer.tp_k_head_num,
+                        )
+                    else:
+                        attn_output[q_len_offset : q_len_offset + q_len] = (
+                            torch.ops.npu.npu_fused_infer_attention_score(
+                                q[None, q_len_offset : q_len_offset + q_len],
+                                k[None, q_len_offset : q_len_offset + q_len],
+                                v[None, q_len_offset : q_len_offset + q_len].contiguous(),
+                                num_heads=layer.tp_q_head_num,
+                                num_key_value_heads=layer.tp_k_head_num,
+                                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                                atten_mask=self.fia_mask.unsqueeze(0),
+                                sparse_mode=3 if q_len != 1 else 0,
+                                scale=layer.scaling,
+                                next_tokens=0,
+                            )[0]
+                        )
                     q_len_offset += q_len
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
