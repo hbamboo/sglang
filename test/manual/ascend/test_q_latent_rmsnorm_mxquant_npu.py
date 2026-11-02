@@ -156,7 +156,7 @@ def make_input(rows, seed, extreme=False, pad=64):
             ]
         )
     else:
-        base = torch.randn((rows, QKV_WIDTH + pad), generator=g, dtype=torch.bfloat16)
+        base = torch.randn((rows, QKV_WIDTH + pad), generator=g).to(torch.bfloat16)
     qkv = base[:, pad : pad + QKV_WIDTH]
     return base, qkv
 
@@ -171,9 +171,9 @@ def make_layer(rows, out_features, seed, device):
     """Build the real NPUMXFP8LinearMethod consumer with processed weights."""
     g = torch.Generator().manual_seed(seed + 17)
     layer = {
-        "weight": torch.randn(
-            (out_features, Q_LORA), generator=g, dtype=torch.bfloat16
-        ).to(device),
+        "weight": torch.randn((out_features, Q_LORA), generator=g)
+        .to(torch.bfloat16)
+        .to(device),
         "bias": None,
     }
 
