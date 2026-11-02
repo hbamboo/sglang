@@ -277,6 +277,16 @@ def dequant_mx(q_fp8, scale_u8):
     return q_fp8.float() * scale.repeat_interleave(BLOCK, dim=-1)
 
 
+def gather_fp8_rows_to_cpu(t, idx):
+    """Gather rows of an FP8 tensor for the CPU oracle.
+
+    Installed aclnnIndex does not implement DT_FLOAT8_E4M3FN, so cast to a
+    supported float type BEFORE the NPU gather.  Byte-level old/new comparisons
+    happen on the raw FP8 tensors before this conversion.
+    """
+    return t.float()[idx].cpu()
+
+
 def cast_e4m3_saturating(x):
     """Saturating E4M3FN conversion used by the declared CPU oracle.
 
@@ -690,9 +700,9 @@ def run_case(rows, seed, eps, device, layout="stride1344_offset", offset=64,
         oracle_fp32 = cpu_mx_quant_oracle(norm_fp32)
         oracle_bf16 = cpu_mx_quant_oracle(norm_bf16)
 
-        q_old_cpu = q_old[idx_dev].cpu()
+        q_old_cpu = gather_fp8_rows_to_cpu(q_old, idx_dev)
         scale_old_cpu = scale_old[idx_dev].cpu()
-        q_new_cpu = q_new[idx_dev].cpu()
+        q_new_cpu = gather_fp8_rows_to_cpu(q_new, idx_dev)
         scale_new_cpu = scale_new[idx_dev].cpu()
         old_deq = dequant_mx(q_old_cpu, scale_old_cpu)
         new_deq = dequant_mx(q_new_cpu, scale_new_cpu)

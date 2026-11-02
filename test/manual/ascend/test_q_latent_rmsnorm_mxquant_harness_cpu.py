@@ -144,6 +144,44 @@ class AcceptanceStatsTest(unittest.TestCase):
         self.assertEqual(H.CRITERIA["near_exact_diagnostic"]["atol"], 2.0**-8)
 
 
+class Fp8GatherTest(unittest.TestCase):
+    def test_fp8_rows_cast_before_indexing(self):
+        t = torch.arange(64, dtype=torch.float32).reshape(8, 8).to(
+            torch.float8_e4m3fn
+        )
+        idx = torch.tensor([0, 3, 7])
+        out = H.gather_fp8_rows_to_cpu(t, idx)
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertTrue(torch.equal(out, t.float()[idx].cpu()))
+
+    def test_fp8_rows_never_index_fp8_directly(self):
+        # aclnnIndex does not support DT_FLOAT8_E4M3FN: the helper must call
+        # .float() before __getitem__.  These guards fail the test if not.
+        class FloatGuard:
+            def __init__(self, t):
+                self._t = t
+
+            def __getitem__(self, idx):
+                return self._t[idx]
+
+        class Fp8Guard:
+            def __init__(self, t):
+                self._t = t
+
+            def float(self):
+                return FloatGuard(self._t.float())
+
+            def __getitem__(self, idx):
+                raise AssertionError("FP8 tensor was indexed directly")
+
+        t = torch.arange(16, dtype=torch.float32).reshape(4, 4).to(
+            torch.float8_e4m3fn
+        )
+        out = H.gather_fp8_rows_to_cpu(Fp8Guard(t), torch.tensor([1, 2]))
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertTrue(torch.equal(out, t.float()[torch.tensor([1, 2])]))
+
+
 class StrideOffsetBuilderTest(unittest.TestCase):
     def test_stride1344_nonzero_offset(self):
         res = H.make_qkv(
