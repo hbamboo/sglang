@@ -10,6 +10,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_for_batch,
 )
+from sglang.srt.hardware_backend.npu.modules.kv_rmsnorm_unified_cache_npu import (
+    maybe_unified_kv_rmsnorm_rope_cache,
+)
 from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     PackedExpandedKV,
     can_fuse_expanded_kv,
@@ -98,23 +101,39 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
-        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-            latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
-            m.kv_a_layernorm.weight,
+        # Narrow opt-in (default off): write the real unified 576-wide cache
+        # layer view directly, touching only the mapped slots.  Unsupported
+        # modes (PA_NZ, quantized dtypes, non-unified pools, graph capture,
+        # torch.compile) return None and keep the original route below.
+        unified_out = maybe_unified_kv_rmsnorm_rope_cache(
+            m,
+            latent_cache,
             cos,
             sin,
-            forward_batch.out_cache_loc.to(torch.int64),
-            k_rope_cache,
-            ckv_cache,
-            k_rope_scale=None,
-            c_kv_scale=None,
-            k_rope_offset=None,
-            c_kv_offset=None,
-            epsilon=m.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
-            is_output_kv=True,
-        )  # adapter NZ
+            forward_batch.out_cache_loc,
+            get_token_to_kv_pool(),
+            is_fia_nz(),
+        )
+        if unified_out is not None:
+            k_pe, kv_a = unified_out
+        else:
+            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
+                m.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=None,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=m.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                is_output_kv=True,
+            )  # adapter NZ
 
         k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
     else:
