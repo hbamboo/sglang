@@ -21,6 +21,9 @@ from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     can_fuse_expanded_kv,
     forward_expanded_prefill,
 )
+from sglang.srt.hardware_backend.npu.modules.q_latent_rmsnorm_mxquant import (
+    forward_q_latent_rmsnorm_mxquant,
+)
 from sglang.srt.hardware_backend.npu.modules.split_kv_b_proj import (
     maybe_forward_split_kv_b_proj,
 )
@@ -75,15 +78,32 @@ def forward_mha_prepare_npu(
             )
 
         else:
-            q = m.q_a_layernorm(q)
-            if (
+            q_latent_all_gather = (
                 _use_ag_after_qlora
                 and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
                 and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-            ):
-                q = scattered_to_tp_attn_full(q, forward_batch)
-                latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
-            q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            )
+            # Narrow opt-in: fuse only RMSNorm + activation DynamicMxQuant and
+            # hand q_b_proj its pre-quantised tuple.  None means "unsupported",
+            # in which case the original BF16 norm path below runs unchanged.
+            q_b_fused = (
+                None
+                if q_latent_all_gather
+                else forward_q_latent_rmsnorm_mxquant(
+                    m.q_a_layernorm, m.q_b_proj, q
+                )
+            )
+            if q_b_fused is None:
+                q = m.q_a_layernorm(q)
+                if q_latent_all_gather:
+                    q = scattered_to_tp_attn_full(q, forward_batch)
+                    latent_cache = scattered_to_tp_attn_full(
+                        latent_cache, forward_batch
+                    )
+                q = m.q_b_proj(q)[0]
+            else:
+                q = q_b_fused
+            q = q.view(-1, m.num_local_heads, m.qk_head_dim)
 
     else:
         q = m.q_proj(hidden_states)[0].view(-1, m.num_local_heads, m.qk_head_dim)
