@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import asdict
+from itertools import product
 from pathlib import Path
 from unittest import mock
 
@@ -227,6 +228,57 @@ class TestNPUHiCacheFileStorage(unittest.TestCase):
         larger_page = larger_host.get_data_page(0)
         self.assertIs(larger_backend.get("shared-page", larger_page), larger_page)
         self.assertTrue(torch.equal(larger_page, page))
+
+    def test_cache_layout_environment_is_namespaced_and_frozen_at_creation(self):
+        flag_names = (
+            "SGLANG_USE_FIA_NZ",
+            "SGLANG_NPU_DISABLE_YARN_KV_SINK",
+            "ENABLE_QKV_NORM_ROPE_OPT",
+        )
+        key = "same-tokens-under-different-cache-layouts"
+        records = []
+        for number, flags in enumerate(product((False, True), repeat=3), start=1):
+            with self.subTest(flags=flags):
+                environment = dict(
+                    zip(flag_names, ("1" if flag else "0" for flag in flags))
+                )
+                with mock.patch.dict(os.environ, environment):
+                    _, host = self._host(unified=False)
+                    _, same_format = self._host(unified=False, pages=12)
+                    signature = host.storage_format
+                # Factory construction happens after leaving the initialization
+                # environment: no flag may be reread to change the namespace.
+                backend = self._backend(host)
+                reader = self._backend(same_format)
+                self.assertEqual(host.storage_format, signature)
+                self.assertEqual(same_format.storage_format, signature)
+                self.assertEqual(backend.config_suffix, reader.config_suffix)
+                self.assertFalse(backend.exists(key))
+                payload = host.get_data_page(0)
+                payload.fill_(number)
+                self.assertTrue(backend.set(key, payload))
+                self.assertTrue(reader.exists(key))
+                target = same_format.get_dummy_flat_data_page()
+                self.assertIs(reader.get(key, target), target)
+                self.assertTrue(torch.equal(target, payload))
+                records.append((flags, host, signature, backend.config_suffix, number))
+        self.assertEqual(len({record[2] for record in records}), 8)
+        self.assertEqual(len({record[3] for record in records}), 8)
+        self.assertEqual(len(list(self.storage_dir.glob("*.bin"))), 8)
+        for flags, host, signature, suffix, number in records:
+            with self.subTest(frozen_flags=flags):
+                opposite_environment = dict(
+                    zip(flag_names, ("0" if flag else "1" for flag in flags))
+                )
+                with mock.patch.dict(os.environ, opposite_environment):
+                    self.assertEqual(host.storage_format, signature)
+                    backend = self._backend(host)
+                    self.assertEqual(backend.config_suffix, suffix)
+                    target = host.get_dummy_flat_data_page()
+                    self.assertIs(backend.get(key, target), target)
+                    # Identical token keys in every other layout namespace
+                    # must neither replace nor leak into this host's payload.
+                    self.assertTrue(torch.all(target == number))
 
     def test_factory_keeps_input_config_unchanged_across_repeated_creation(self):
         _, host = self._host()

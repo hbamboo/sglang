@@ -8,9 +8,12 @@ from typing import Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.utils import get_bool_env_var
 
 
 def _transfer_kv_pages(device, host, device_indices, host_indices, page_size, h2d):
@@ -69,6 +72,11 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             raise ValueError("Ascend MLA HiCache does not support packed MTP pools")
         if getattr(device_pool, "prefill_expanded_geometry", None) is not None:
             raise ValueError("Ascend MLA HiCache cannot restore expanded prefill KV")
+        self._cache_layout_flags = (
+            get_bool_env_var("SGLANG_USE_FIA_NZ"),
+            envs.SGLANG_NPU_DISABLE_YARN_KV_SINK.get(),
+            get_bool_env_var("ENABLE_QKV_NORM_ROPE_OPT"),
+        )
         self.mtp_draft_device_pools = ()
         self.unified_kv = bool(getattr(device_pool, "unified_kv", False))
         width = device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
@@ -270,6 +278,7 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
                 self.end_layer,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
+                self._cache_layout_flags,
                 components,
             )
         )
