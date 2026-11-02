@@ -532,6 +532,32 @@ class DeepseekV2WeightLoaderMixin:
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
+        # Split KV-B weights are derived state.  Refresh only layers touched by
+        # this load and drop the rest when a partial reload named its weights,
+        # so a later forward cannot observe buffers derived from old weights.
+        split_enabled = False
+        split_prepared = 0
+        split_skipped = {}
+        if not is_nextn:
+            from sglang.srt.hardware_backend.npu.modules.split_kv_b_proj import (
+                invalidate_split_kv_b_proj,
+                is_split_kv_b_proj_enabled,
+                prepare_split_kv_b_proj,
+            )
+
+            split_enabled = is_split_kv_b_proj_enabled()
+            if split_enabled and weight_names is not None:
+                processed_layer_ids = set(layer_ids)
+                for layer_id in range(
+                    self.model.start_layer, self.model.end_layer
+                ):
+                    if layer_id in processed_layer_ids:
+                        continue
+                    stale_attn = self.model.layers[layer_id].self_attn
+                    invalidate_split_kv_b_proj(
+                        getattr(stale_attn, "kv_b_proj", None)
+                    )
+
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
@@ -739,6 +765,38 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+            if split_enabled:
+                kv_b_proj = getattr(self_attn, "kv_b_proj", None)
+                try:
+                    _, split_reason = prepare_split_kv_b_proj(
+                        self_attn, kv_b_proj
+                    )
+                except Exception:
+                    # A derived optimization must never break model loading.
+                    logger.exception(
+                        "SGLANG_NPU_SPLIT_KV_B_PROJ preparation failed; "
+                        "falling back to the original kv_b_proj"
+                    )
+                    invalidate_split_kv_b_proj(kv_b_proj)
+                    split_reason = "exception"
+                if split_reason in ("prepared", "already prepared"):
+                    split_prepared += 1
+                else:
+                    split_skipped[split_reason] = (
+                        split_skipped.get(split_reason, 0) + 1
+                    )
+
+        if split_enabled:
+            logger.info(
+                "SGLANG_NPU_SPLIT_KV_B_PROJ: prepared %d layer(s)%s",
+                split_prepared,
+                (
+                    ""
+                    if not split_skipped
+                    else f"; skipped {dict(sorted(split_skipped.items()))}"
+                ),
+            )
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):

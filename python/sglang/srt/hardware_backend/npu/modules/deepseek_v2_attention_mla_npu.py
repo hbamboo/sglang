@@ -21,6 +21,9 @@ from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     can_fuse_expanded_kv,
     forward_expanded_prefill,
 )
+from sglang.srt.hardware_backend.npu.modules.split_kv_b_proj import (
+    maybe_forward_split_kv_b_proj,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -154,14 +157,20 @@ def forward_mha_prepare_npu(
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
-    kv = m.kv_b_proj(kv_a)[0]
-    kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
-    if not m.use_dsa and can_fuse_expanded_kv(
-        get_token_to_kv_pool(), forward_batch, kv, k_pe
-    ):
-        return q, PackedExpandedKV(kv, k_pe, m.qk_nope_head_dim), None, forward_batch
-    k_nope = kv[..., : m.qk_nope_head_dim]
-    v = kv[..., m.qk_nope_head_dim :].contiguous()
+    split_kv = maybe_forward_split_kv_b_proj(m, m.kv_b_proj, kv_a, forward_batch)
+    if split_kv is not None:
+        # Opt-in split projection: physically contiguous per-head K_nope/V.
+        # The expanded-KV packed layout is intentionally not produced here.
+        k_nope, v = split_kv
+    else:
+        kv = m.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
+        if not m.use_dsa and can_fuse_expanded_kv(
+            get_token_to_kv_pool(), forward_batch, kv, k_pe
+        ):
+            return q, PackedExpandedKV(kv, k_pe, m.qk_nope_head_dim), None, forward_batch
+        k_nope = kv[..., : m.qk_nope_head_dim]
+        v = kv[..., m.qk_nope_head_dim :].contiguous()
 
     k = m._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
     return q, k, v, forward_batch
