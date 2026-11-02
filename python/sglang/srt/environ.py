@@ -764,6 +764,8 @@ class Envs:
     SGLANG_NPU_MOE_PREQUANT_ROUTING = EnvBool(False)
     # Stable byte routing for qualified eager PD prefill; optional kernel companion.
     SGLANG_NPU_MOE_STABLE_ROUTING = EnvBool(False)
+    # Reuse MXFP8 expert counts directly in qualified eager PD-prefill GMM1.
+    SGLANG_NPU_GMM1_COUNTS = EnvBool(False)
     # MiB kept out of the profiled KV budget for NPU prefill activations/workspace.
     # Set only on P. Zero preserves the existing capacity calculation.
     SGLANG_NPU_PREFILL_TRANSIENT_RESERVE_MB = EnvInt(0)
