@@ -300,4 +300,17 @@ def maybe_forward_expanded_prefill_fas(backend, query, layer, forward_batch):
         pre_tockens=2147483647,
         next_tockens=0,
     )
+    # Count actual eager operator submissions, not just eligible decisions.
+    backend.prefill_fas_execution_count = (
+        getattr(backend, "prefill_fas_execution_count", 0) + 1
+    )
+    if backend.prefill_fas_execution_count == 1:
+        logger.info(
+            "SGLANG_NPU_PREFILL_FAS first execution: layer=%s, batch=%s, "
+            "new_tokens=%s, prefixes=%s",
+            layer.layer_id,
+            len(decision.q_lengths),
+            sum(decision.q_lengths),
+            tuple(k - q for k, q in zip(decision.kv_lengths, decision.q_lengths)),
+        )
     return outputs[0]
