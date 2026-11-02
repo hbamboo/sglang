@@ -371,6 +371,23 @@ class TestIdentityAndMetadata(unittest.TestCase):
         self.assertEqual(rotary.get_calls, 2)
         self.assertEqual(cos.dtype, torch.float32)
 
+    def test_key_retains_live_references(self):
+        rotary = MockRotary(*make_tables())
+        positions = torch.tensor([1, 2, 3], dtype=torch.long)
+        cache = {}
+        cache_mod.get_or_compute_cached(
+            rotary, positions, torch.bfloat16, cache
+        )
+        namespace = cache[cache_mod._NAMESPACE]
+        key = next(iter(namespace))
+        # The key itself keeps the objects alive, so a later Python id reuse
+        # cannot masquerade as this input.
+        self.assertIs(key.rotary, rotary)
+        self.assertIs(key.positions, positions)
+        self.assertIs(key.cos_table, rotary.cos_cached_total)
+        self.assertIs(key.sin_table, rotary.sin_cached_total)
+        self.assertEqual(namespace[key][0].device, positions.device)
+
     def test_stream_identity_is_part_of_the_key(self):
         rotary = MockRotary(*make_tables())
         positions = torch.tensor([1, 2, 3], dtype=torch.long)
@@ -469,38 +486,178 @@ class TestFallbacks(unittest.TestCase):
             )
         self.assertEqual(cache, {})
 
-    def test_inference_positions_fall_back_without_crashing(self):
+    def test_inference_marker_is_explicit_not_version_zero(self):
+        normal = torch.tensor([1, 2, 3], dtype=torch.long)
+        self.assertEqual(cache_mod._mutation_marker(normal), 0)
+        self.assertIsNot(
+            cache_mod._mutation_marker(normal), cache_mod._INFERENCE_MARKER
+        )
+        with torch.inference_mode():
+            inference = torch.tensor([1, 2, 3], dtype=torch.long)
+            marker = cache_mod._mutation_marker(inference)
+            self.assertIs(marker, cache_mod._INFERENCE_MARKER)
+            self.assertIsNot(marker, 0)
+            self.assertFalse(marker == 0)
+
+    def test_inference_positions_reuse_within_forward(self):
         rotary = MockRotary(*make_tables())
         cache = {}
         with torch.inference_mode():
             positions = torch.tensor([1, 2, 3], dtype=torch.long)
-            self.assertTrue(cache_mod._is_inference_tensor(positions))
-            self.assertIsNone(cache_mod._version_or_none(positions))
-            for expected_calls in (1, 2):
-                cos, _ = cache_mod.get_or_compute_cached(
-                    rotary, positions, torch.float32, cache
-                )
-                self.assertEqual(rotary.get_calls, expected_calls)
-                self.assertEqual(cache, {})
-                want_cos, _ = expected_cos_sin(
-                    rotary, positions, torch.float32
-                )
-                self.assertTrue(torch.equal(cos, want_cos))
+            cos1, sin1 = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            cos2, sin2 = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            self.assertIs(cos1, cos2)
+            self.assertIs(sin1, sin2)
+            self.assertEqual(rotary.get_calls, 1)
+            self.assertEqual(len(cache), 1)
+            want_cos, want_sin = expected_cos_sin(
+                rotary, positions, torch.float32
+            )
+            self.assertTrue(torch.equal(cos1, want_cos))
+            self.assertTrue(torch.equal(sin1, want_sin))
 
-    def test_inference_source_tables_fall_back_without_crashing(self):
+    def test_inference_source_tables_reuse_within_forward(self):
         with torch.inference_mode():
-            cos_table = torch.randn(64, 64)
-            sin_table = torch.randn(64, 64)
+            cos_table = torch.randn(ROPE_DIM, ROPE_DIM)
+            sin_table = torch.randn(ROPE_DIM, ROPE_DIM)
         rotary = MockRotary(cos_table, sin_table)
         positions = torch.tensor([1, 2, 3], dtype=torch.long)
         cache = {}
         with torch.inference_mode():
-            for expected_calls in (1, 2):
-                cache_mod.get_or_compute_cached(
-                    rotary, positions, torch.float32, cache
-                )
-                self.assertEqual(rotary.get_calls, expected_calls)
-                self.assertEqual(cache, {})
+            first = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            second = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            self.assertIs(first[0], second[0])
+            self.assertIs(first[1], second[1])
+            self.assertEqual(rotary.get_calls, 1)
+            self.assertEqual(len(cache), 1)
+            want_cos, want_sin = expected_cos_sin(
+                rotary, positions, torch.float32
+            )
+            self.assertTrue(torch.equal(first[0], want_cos))
+            self.assertTrue(torch.equal(first[1], want_sin))
+
+    def test_inference_positions_and_tables_two_layers(self):
+        """The required real-inference shape: both inputs are inference tensors."""
+        with torch.inference_mode():
+            cos_table = torch.randn(ROPE_DIM, ROPE_DIM)
+            sin_table = torch.randn(ROPE_DIM, ROPE_DIM)
+            positions = torch.tensor([5, 0, 5], dtype=torch.long)
+        rotary = MockRotary(cos_table, sin_table)
+        cache = {}
+        with torch.inference_mode():
+            layer0 = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.bfloat16, cache
+            )
+            layer1 = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.bfloat16, cache
+            )
+            self.assertIs(layer0[0], layer1[0])
+            self.assertIs(layer0[1], layer1[1])
+            self.assertEqual(rotary.get_calls, 1)
+            want_cos, want_sin = expected_cos_sin(
+                rotary, positions, torch.bfloat16
+            )
+            self.assertTrue(torch.equal(layer0[0], want_cos))
+            self.assertTrue(torch.equal(layer0[1], want_sin))
+
+    def test_inference_next_forward_reset_refreshes_same_storage(self):
+        with torch.inference_mode():
+            positions = torch.tensor([1, 2, 3], dtype=torch.long)
+            cos_table = torch.randn(ROPE_DIM, ROPE_DIM)
+            sin_table = torch.randn(ROPE_DIM, ROPE_DIM)
+        rotary = MockRotary(cos_table, sin_table)
+        cache = {}
+        with torch.inference_mode():
+            cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            # Model forward boundary: the whole dictionary is replaced.
+            cache = {}
+            positions.copy_(torch.tensor([9, 8, 7]))
+            cos, _ = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            self.assertEqual(rotary.get_calls, 2)
+            want_cos, _ = expected_cos_sin(
+                rotary, positions, torch.float32
+            )
+            self.assertTrue(torch.equal(cos, want_cos))
+
+    def test_inference_mutation_requires_explicit_invalidation(self):
+        with torch.inference_mode():
+            positions = torch.tensor([1, 2, 3], dtype=torch.long)
+            cache = {}
+            rotary = MockRotary(*make_tables())
+            cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            self.assertEqual(rotary.get_calls, 1)
+            before = cache_mod._mutation_marker(positions)
+            positions.add_(4)
+            # No version counter exists, so the marker cannot change; the
+            # within-forward immutability contract was broken, and the caller
+            # must say so explicitly.
+            self.assertIs(cache_mod._mutation_marker(positions), before)
+            cache_mod.invalidate_mha_rope_cache(cache)
+            self.assertEqual(cache, {})
+            cos, _ = cache_mod.get_or_compute_cached(
+                rotary, positions, torch.float32, cache
+            )
+            self.assertEqual(rotary.get_calls, 2)
+            want_cos, _ = expected_cos_sin(
+                rotary, positions, torch.float32
+            )
+            self.assertTrue(torch.equal(cos, want_cos))
+
+    def test_data_copy_does_not_bump_normal_marker(self):
+        # Documented limitation: .data.copy_ bypasses the version counter.
+        # The per-forward dictionary reset is the boundary for this operation.
+        positions = torch.tensor([1, 2, 3], dtype=torch.long)
+        before = cache_mod._mutation_marker(positions)
+        positions.data.copy_(torch.tensor([7, 8, 9]))
+        self.assertEqual(cache_mod._mutation_marker(positions), before)
+
+
+class TestInvalidationHelper(unittest.TestCase):
+    def test_invalidate_accepts_cache_dict_and_forward_batch(self):
+        rotary = MockRotary(*make_tables())
+        positions = torch.tensor([1, 2, 3], dtype=torch.long)
+        cache = {}
+        cache_mod.get_or_compute_cached(
+            rotary, positions, torch.bfloat16, cache
+        )
+        sibling_key = ("mla-key", 0)
+        cache[sibling_key] = "mla-entry"
+        cache_mod.invalidate_mha_rope_cache(cache)
+        # Only this module's namespace is dropped; MLA entries survive.
+        self.assertIn(sibling_key, cache)
+        self.assertNotIn(cache_mod._NAMESPACE, cache)
+        cache_mod.get_or_compute_cached(
+            rotary, positions, torch.bfloat16, cache
+        )
+        self.assertEqual(rotary.get_calls, 2)
+
+        batch = SimpleNamespace(**{cache_mod.CACHE_ATTR: dict(cache)})
+        cache_mod.invalidate_mha_rope_cache(batch)
+        self.assertNotIn(cache_mod._NAMESPACE, batch.npu_mlaprolog_rope_cache)
+
+    def test_invalidate_is_safe_without_a_cache(self):
+        cache_mod.invalidate_mha_rope_cache(None)
+        cache_mod.invalidate_mha_rope_cache(SimpleNamespace())
+        cache_mod.invalidate_mha_rope_cache(
+            SimpleNamespace(**{cache_mod.CACHE_ATTR: None})
+        )
 
 
 class TestProductionGuards(unittest.TestCase):
@@ -530,6 +687,8 @@ class TestProductionGuards(unittest.TestCase):
             cache_mod, "_is_stream_capturing", side_effect=AssertionError
         ), patch.object(
             cache_mod, "_current_stream", side_effect=AssertionError
+        ), patch.object(
+            cache_mod, "_mutation_marker", side_effect=AssertionError
         ):
             cos, _ = cache_mod.get_mha_rope_cos_sin(
                 rotary, positions, torch.bfloat16, batch
@@ -549,6 +708,8 @@ class TestProductionGuards(unittest.TestCase):
             cache_mod, "_is_stream_capturing", return_value=True
         ), patch.object(
             cache_mod, "_current_stream", side_effect=AssertionError
+        ), patch.object(
+            cache_mod, "_mutation_marker", side_effect=AssertionError
         ):
             cache_mod.get_mha_rope_cos_sin(
                 rotary, positions, torch.bfloat16, batch
@@ -563,6 +724,8 @@ class TestProductionGuards(unittest.TestCase):
             cache_mod, "_is_compiling", return_value=False
         ), patch.object(
             cache_mod, "_is_stream_capturing", side_effect=AssertionError
+        ), patch.object(
+            cache_mod, "_mutation_marker", side_effect=AssertionError
         ):
             cache_mod.get_mha_rope_cos_sin(
                 rotary, positions, torch.bfloat16, batch
@@ -624,6 +787,29 @@ class TestProductionGuards(unittest.TestCase):
         self.assertTrue(torch.equal(cos, want_cos))
         self.assertTrue(torch.equal(sin, want_sin))
 
+    def test_enabled_guarded_path_reuses_inference_tensors(self):
+        with torch.inference_mode():
+            cos_table = torch.randn(ROPE_DIM, ROPE_DIM)
+            sin_table = torch.randn(ROPE_DIM, ROPE_DIM)
+            positions = torch.tensor([1, 2, 3], dtype=torch.long)
+        rotary = MockRotary(cos_table, sin_table)
+        batch = SimpleNamespace(**{cache_mod.CACHE_ATTR: {}})
+        with torch.inference_mode(), forced_eligible_guards():
+            cos, sin = cache_mod.get_mha_rope_cos_sin(
+                rotary, positions, torch.bfloat16, batch
+            )
+            cos2, sin2 = cache_mod.get_mha_rope_cos_sin(
+                rotary, positions, torch.bfloat16, batch
+            )
+            self.assertEqual(rotary.get_calls, 1)
+            self.assertIs(cos, cos2)
+            self.assertIs(sin, sin2)
+            want_cos, want_sin = expected_cos_sin(
+                rotary, positions, torch.bfloat16
+            )
+            self.assertTrue(torch.equal(cos, want_cos))
+            self.assertTrue(torch.equal(sin, want_sin))
+
 
 class TestTboChildIndependence(unittest.TestCase):
     def test_each_child_dict_is_independent(self):
@@ -683,6 +869,10 @@ class TestSourceContracts(unittest.TestCase):
     def test_helper_uses_the_reset_attribute_and_no_positions_to_cpu(self):
         text = HELPER_PATH.read_text()
         self.assertIn('CACHE_ATTR = "npu_mlaprolog_rope_cache"', text)
+        self.assertIn("_INFERENCE_MARKER", text)
+        self.assertIn("def invalidate_mha_rope_cache", text)
+        self.assertIn("self.positions is other.positions", text)
+        self.assertNotIn("self.positions == other.positions", text)
         self.assertNotIn("data_ptr", text)
         self.assertNotIn(".cpu(", text)
         self.assertNotIn(".tolist(", text)

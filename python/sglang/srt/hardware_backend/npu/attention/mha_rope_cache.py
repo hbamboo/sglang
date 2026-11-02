@@ -19,16 +19,23 @@ Lifecycle and support scope
 * Supported route: eager NPU inference only.  ``torch.compile`` and NPU graph
   capture both fall back to the original lookup because warmup results cannot
   be reused and a replay must still execute its graph-side gather.
-* Tensors that cannot prove version tracking (inference tensors) fall back.
-  ``_version`` does not observe ``.data.copy_``; the per-forward reset and the
-  normal in-place mutation contract remain required.  No arbitrary mutation
-  detection is claimed.
+* Inference tensors are supported on the enabled eager path.  They have no
+  ``_version`` counter, so the key records an explicit inference marker plus
+  the framework's per-forward immutability precondition (positions and source
+  tables are not mutated within one model forward, and the model replaces the
+  dictionary before every step/capture invocation).  No fabricated version 0
+  is used.  A caller that must mutate an inference tensor in place within a
+  forward must call :func:`invalidate_mha_rope_cache` first; arbitrary
+  mutation detection is not claimed.
+  ``_version`` also does not observe ``.data.copy_`` on normal tensors, so the
+  per-forward reset remains the invalidation boundary for that operation.
 * Cache identity keeps live object references (not only a bare ``id``) for
   the rotary module, both FP32 source tables and the positions/offsets
-  tensors, together with their normal ``_version`` counters, requested
-  dtype/device and the current NPU stream.  Different views, table
-  replacement, in-place mutation, a different dtype/device/offsets or a
-  different stream therefore miss instead of reusing stale values.
+  tensors, together with mutation markers (normal ``_version`` counters or
+  the explicit inference marker), requested dtype/device and the current NPU
+  stream.  Different views, table replacement, normal in-place mutation, a
+  different dtype/device/offsets or a different stream therefore miss instead
+  of reusing stale values.
 * On a hit the exact cached ``(cos, sin)`` tensors are returned: no gather,
   cast, reshape or copy.  On a miss the original
   ``rotary.get_cos_sin_cache(positions, dtype, offsets=offsets)`` is called
@@ -39,7 +46,7 @@ Lifecycle and support scope
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -57,11 +64,15 @@ _ENABLED = os.environ.get(_ENV_VAR, "").strip().lower() in ("1", "true")
 # this sentinel keeps the two schemes from ever colliding.
 _NAMESPACE = object()
 _UNKNOWN_STREAM = object()
+# Explicit "this tensor is immutable-by-forward-contract" marker.  It is a
+# unique object, never an integer, so it can never be confused with version 0.
+_INFERENCE_MARKER = object()
 
 __all__ = [
     "CACHE_ATTR",
     "get_mha_rope_cos_sin",
     "get_or_compute_cached",
+    "invalidate_mha_rope_cache",
     "is_enabled",
 ]
 
@@ -133,48 +144,70 @@ def _stream_token(stream):
 def _is_inference_tensor(tensor: torch.Tensor) -> bool:
     fn = getattr(torch, "is_inference", None)
     if fn is None:
-        # Without the check we cannot rule out a version-less tensor.
-        return True
+        # Older runtimes without inference tensors: fall through to _version.
+        return False
     return bool(fn(tensor))
 
 
-def _version_or_none(tensor: torch.Tensor) -> Optional[int]:
-    """Normal mutation version, or ``None`` when no safe answer exists.
+def _mutation_marker(tensor: torch.Tensor):
+    """Mutation identity for a tensor used by the cache key.
 
-    Inference tensors deliberately do not track a version counter.  Treating
-    them as version 0 would silently cache stale values, so they always miss.
+    Normal tensors expose a real ``_version`` counter.  Inference tensors
+    deliberately have none (accessing it raises RuntimeError); for them the key
+    records ``_INFERENCE_MARKER`` and relies on the documented within-forward
+    immutability contract plus :func:`invalidate_mha_rope_cache`.  ``None``
+    means no safe marker exists and the caller must fall back.
     """
     if _is_inference_tensor(tensor):
-        return None
+        return _INFERENCE_MARKER
     try:
         return tensor._version
     except (AttributeError, NotImplementedError, RuntimeError):
         return None
 
 
-def _cache_inputs_supported(rotary_emb, positions, offsets) -> bool:
-    """Check the exact tensor metadata this cache relies on."""
+def _cache_metadata(rotary_emb, positions, offsets):
+    """Return the tables and mutation markers, or ``None`` to fall back.
+
+    Inference positions and inference source tables are supported here; the
+    compatibility check is about tensor layout and marker availability, not
+    about requiring a version counter.
+    """
     if not isinstance(positions, torch.Tensor):
-        return False
+        return None
     if not callable(getattr(rotary_emb, "get_cos_sin_cache", None)):
-        return False
+        return None
     cos_table = getattr(rotary_emb, "cos_cached_total", None)
     sin_table = getattr(rotary_emb, "sin_cached_total", None)
     if not isinstance(cos_table, torch.Tensor):
-        return False
+        return None
     if not isinstance(sin_table, torch.Tensor):
-        return False
-    tensors = (positions, cos_table, sin_table)
+        return None
     if offsets is not None:
         if not isinstance(offsets, torch.Tensor):
-            return False
-        tensors = tensors + (offsets,)
-    # Accessing _version is only valid once inference tensors are excluded;
-    # stop at the first one instead of pretending it is version 0.
-    for tensor in tensors:
-        if _version_or_none(tensor) is None:
-            return False
-    return True
+            return None
+
+    positions_marker = _mutation_marker(positions)
+    cos_marker = _mutation_marker(cos_table)
+    sin_marker = _mutation_marker(sin_table)
+    offsets_marker = None if offsets is None else _mutation_marker(offsets)
+    if positions_marker is None or cos_marker is None or sin_marker is None:
+        return None
+    if offsets is not None and offsets_marker is None:
+        return None
+    return (
+        cos_table,
+        sin_table,
+        positions_marker,
+        cos_marker,
+        sin_marker,
+        offsets_marker,
+    )
+
+
+def _cache_inputs_supported(rotary_emb, positions, offsets) -> bool:
+    """Check the exact tensor metadata this cache relies on."""
+    return _cache_metadata(rotary_emb, positions, offsets) is not None
 
 
 class _MhaRopeCacheKey:
@@ -197,10 +230,10 @@ class _MhaRopeCacheKey:
         "offsets_dtype",
         "stream",
         "stream_token",
-        "cos_version",
-        "sin_version",
-        "positions_version",
-        "offsets_version",
+        "cos_marker",
+        "sin_marker",
+        "positions_marker",
+        "offsets_marker",
         "_hash",
     )
 
@@ -214,6 +247,10 @@ class _MhaRopeCacheKey:
         dtype,
         device,
         stream,
+        cos_marker,
+        sin_marker,
+        positions_marker,
+        offsets_marker,
     ):
         self.rotary = rotary_emb
         self.cos_table = cos_table
@@ -226,12 +263,12 @@ class _MhaRopeCacheKey:
         self.offsets_dtype = None if offsets is None else offsets.dtype
         self.stream = stream
         self.stream_token = _stream_token(stream)
-        # These are read after _cache_inputs_supported() excluded inference
-        # tensors, so a version counter is guaranteed to exist.
-        self.cos_version = cos_table._version
-        self.sin_version = sin_table._version
-        self.positions_version = positions._version
-        self.offsets_version = None if offsets is None else offsets._version
+        # Precomputed by _cache_metadata so this class never touches
+        # Tensor._version (which would raise for inference tensors).
+        self.cos_marker = cos_marker
+        self.sin_marker = sin_marker
+        self.positions_marker = positions_marker
+        self.offsets_marker = offsets_marker
         self._hash = hash(
             (
                 id(self.rotary),
@@ -244,10 +281,10 @@ class _MhaRopeCacheKey:
                 self.positions_dtype,
                 self.offsets_dtype,
                 self.stream_token,
-                self.cos_version,
-                self.sin_version,
-                self.positions_version,
-                self.offsets_version,
+                self.cos_marker,
+                self.sin_marker,
+                self.positions_marker,
+                self.offsets_marker,
             )
         )
 
@@ -255,6 +292,9 @@ class _MhaRopeCacheKey:
         return self._hash
 
     def __eq__(self, other) -> bool:
+        # Tensors are compared by live identity only; every other field is
+        # non-tensor metadata (markers are ints or the inference sentinel).
+        # Nothing here performs elementwise Tensor equality or boolean tests.
         if not isinstance(other, _MhaRopeCacheKey):
             return NotImplemented
         return (
@@ -268,10 +308,10 @@ class _MhaRopeCacheKey:
             and self.positions_dtype == other.positions_dtype
             and self.offsets_dtype == other.offsets_dtype
             and self.stream_token == other.stream_token
-            and self.cos_version == other.cos_version
-            and self.sin_version == other.sin_version
-            and self.positions_version == other.positions_version
-            and self.offsets_version == other.offsets_version
+            and self.cos_marker == other.cos_marker
+            and self.sin_marker == other.sin_marker
+            and self.positions_marker == other.positions_marker
+            and self.offsets_marker == other.offsets_marker
         )
 
 
@@ -291,11 +331,18 @@ def get_or_compute_cached(
     """
     if not isinstance(cache, dict):
         return _original(rotary_emb, positions, dtype, offsets)
-    if not _cache_inputs_supported(rotary_emb, positions, offsets):
+    metadata = _cache_metadata(rotary_emb, positions, offsets)
+    if metadata is None:
         return _original(rotary_emb, positions, dtype, offsets)
 
-    cos_table = rotary_emb.cos_cached_total
-    sin_table = rotary_emb.sin_cached_total
+    (
+        cos_table,
+        sin_table,
+        positions_marker,
+        cos_marker,
+        sin_marker,
+        offsets_marker,
+    ) = metadata
     key = _MhaRopeCacheKey(
         rotary_emb,
         cos_table,
@@ -305,6 +352,10 @@ def get_or_compute_cached(
         dtype,
         positions.device,
         stream,
+        cos_marker,
+        sin_marker,
+        positions_marker,
+        offsets_marker,
     )
 
     namespace = cache.get(_NAMESPACE)
@@ -322,6 +373,23 @@ def get_or_compute_cached(
     return cos, sin
 
 
+def invalidate_mha_rope_cache(forward_batch_or_cache) -> None:
+    """Explicitly drop this module's entries for the current forward.
+
+    The normal lifecycle is the model's per-forward dictionary reset.  This
+    helper exists for the documented exception: a caller that mutates an
+    inference positions tensor or inference source table in place *within* one
+    model forward (inference tensors have no ``_version`` counter) must call
+    this before asking for cos/sin again.  It removes only this module's
+    private namespace, leaving MLA-preprocess entries intact.
+    """
+    cache = forward_batch_or_cache
+    if not isinstance(cache, dict):
+        cache = getattr(cache, CACHE_ATTR, None)
+    if isinstance(cache, dict):
+        cache.pop(_NAMESPACE, None)
+
+
 def get_mha_rope_cos_sin(
     rotary_emb,
     positions,
@@ -333,8 +401,11 @@ def get_mha_rope_cos_sin(
 
     Falls back to the original call whenever reuse cannot be proven safe:
     disabled flag, Dynamo tracing, non-NPU positions, NPU graph capture,
-    missing/None cache dict, unavailable stream identity, unexpected tensor
-    metadata or version-less (inference) tensors.
+    missing/None cache dict, unavailable stream identity, an unexpected table
+    layout, or an unreadable mutation marker on a non-inference tensor.
+    Inference tensors are supported under the within-forward immutability
+    contract; call :func:`invalidate_mha_rope_cache` if that contract is
+    explicitly broken in place.
     """
     if not _ENABLED:
         return _original(rotary_emb, positions, dtype, offsets)
