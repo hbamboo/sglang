@@ -988,6 +988,9 @@ class AscendAttnBackend(AttentionBackend):
         max_kv = -1
         if not self.graph_mode:
             max_kv = self.forward_metadata.fmla_max_seqlen_kv or -1
+            if max_kv > 0:
+                # Eager metadata buckets may exceed a short request's table.
+                max_kv = min(max_kv, block_tables.shape[1] * self.page_size)
         md = self._fmla_metadata_for(
             bs=bs,
             max_seqlen_kv=max_kv,
