@@ -126,6 +126,18 @@ class AcceptanceStatsTest(unittest.TestCase):
         stats = H.quant_oracle_stats(oracle, gross, scale_bytes)
         self.assertFalse(H.quant_oracle_pass(stats))
 
+    def test_tolerance_stats_keeps_2d_shapes_aligned(self):
+        # Regression: diff was flattened while tol stayed 2-D, which broadcast
+        # only for a single row and failed at T>1.
+        diff = torch.ones((4, 8))
+        tol = torch.full((4, 8), 1.5)
+        stats = H.tolerance_stats(diff, tol)
+        self.assertEqual(stats["count"], 32)
+        self.assertEqual(stats["matched"], 32)
+        tight = torch.full((4, 8), 0.5)
+        stats = H.tolerance_stats(diff, tight)
+        self.assertEqual(stats["matched"], 0)
+
     def test_byte_match_counts_and_scales_bytes(self):
         a = torch.tensor([0, 1, 2, 3], dtype=torch.uint8)
         b = torch.tensor([0, 1, 9, 3], dtype=torch.uint8)

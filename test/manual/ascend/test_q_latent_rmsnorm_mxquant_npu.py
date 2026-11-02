@@ -162,6 +162,7 @@ def match_stats(ref, got, atol, rtol, chunk_rows=1024):
 
 def tolerance_stats(diff, tol):
     diff = diff.reshape(-1)
+    tol = tol.reshape(-1)
     finite = torch.isfinite(diff)
     matched = int(((diff <= tol) & finite).sum().item())
     total = int(diff.numel())
