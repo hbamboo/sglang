@@ -66,6 +66,59 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _ascend_paged_buffer(buffer, page_size: int, layer_num: int) -> torch.Tensor:
+    """Recover the dense allocation behind NPU FIA's per-layer graph views.
+
+    Rebuild a view only when every layer belongs to one ordered allocation.
+    Stacking would allocate a copy and H2D writes would miss the real cache.
+    """
+    if isinstance(buffer, torch.Tensor):
+        if (
+            buffer.ndim != 5
+            or buffer.shape[0] != layer_num
+            or buffer.shape[2] != page_size
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError(
+                "Ascend HiCache requires a dense [layer, page, token, head, dim] buffer"
+            )
+        return buffer
+    if not isinstance(buffer, (list, tuple)) or len(buffer) != layer_num or not buffer:
+        raise ValueError("Ascend HiCache requires one FIA tensor view per layer")
+    first = buffer[0]
+    if (
+        not isinstance(first, torch.Tensor)
+        or first.ndim != 4
+        or first.shape[1] != 1
+        or first.shape[0] % page_size != 0
+        or not first.is_contiguous()
+    ):
+        raise ValueError(
+            "Ascend HiCache requires dense FIA [token, 1, head, dim] views"
+        )
+    layer_elements = first.numel()
+    storage_ptr = first.untyped_storage().data_ptr()
+    for layer_id, layer in enumerate(buffer):
+        if (
+            not isinstance(layer, torch.Tensor)
+            or layer.shape != first.shape
+            or layer.dtype != first.dtype
+            or layer.device != first.device
+            or not layer.is_contiguous()
+            or layer.untyped_storage().data_ptr() != storage_ptr
+            or layer.storage_offset()
+            != first.storage_offset() + layer_id * layer_elements
+        ):
+            raise ValueError(
+                "Ascend HiCache FIA layers must share one ordered dense allocation"
+            )
+    heads, dim = first.shape[-2:]
+    return first.as_strided(
+        (layer_num, first.shape[0] // page_size, page_size, heads, dim),
+        (layer_elements, page_size * heads * dim, heads * dim, dim, 1),
+    )
+
+
 class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool | None = None
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
@@ -106,7 +159,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first":
+        if self.layout in ("page_first", "page_first_direct"):
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             k_transposed = self.k_buffer.transpose(0, 1)
@@ -243,6 +296,33 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def _check_ascend_transfer_support(self, device_pool):
+        if self.layout != "page_first_direct":
+            raise ValueError(
+                "Ascend MHA HiCache requires page_first_direct host layout"
+            )
+        if self.mtp_draft_device_pools or self._is_device_layer_sharded(device_pool):
+            raise NotImplementedError(
+                "Ascend MHA HiCache does not support packed MTP or layer-sharded pools"
+            )
+
+    def _transfer_ascend(self, device_pool, host_indices, device_indices, direction):
+        self._check_ascend_transfer_support(device_pool)
+        transfer_kv_dim_exchange(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=_ascend_paged_buffer(
+                device_pool.k_buffer, self.page_size, self.layer_num
+            ),
+            host_k=self.k_buffer,
+            device_v=_ascend_paged_buffer(
+                device_pool.v_buffer, self.page_size, self.layer_num
+            ),
+            host_v=self.v_buffer,
+            page_size=self.page_size,
+            direction=direction,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -253,6 +333,18 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if io_backend == "kernel_ascend":
+            self._check_ascend_transfer_support(device_pool)
+            if is_draft:
+                raise NotImplementedError(
+                    "Ascend MHA HiCache does not support draft sidecar transfers"
+                )
+            # All layers land before the controller records the first layer event.
+            if layer_id == 0:
+                self._transfer_ascend(
+                    device_pool, host_indices, device_indices, TransferDirection.H2D
+                )
+            return
         if self.device_pool is not None:
             if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
                 return
@@ -355,22 +447,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
-                # Ascend-specific: transfer KV data for all layers when layer_id == 0
-                if host_layer_id == 0:
-                    transfer_kv_dim_exchange(
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
-                        host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
-                        host_v=self.v_buffer,
-                        page_size=self.page_size,
-                        direction=TransferDirection.H2D,
-                    )
-            else:
-                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -393,17 +469,17 @@ class MHATokenToKVPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if io_backend == "kernel_ascend":
-            # NPU pools use contiguous multi-layer tensors and intentionally do
-            # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.
-            device_kv_buffers = None
-        else:
-            (
-                device_k_data_ptrs,
-                device_v_data_ptrs,
-                device_k_buffers,
-                device_v_buffers,
-            ) = self._resolve_device_transfer_buffers(device_pool)
-            device_kv_buffers = device_k_buffers + device_v_buffers
+            self._transfer_ascend(
+                device_pool, host_indices, device_indices, TransferDirection.D2H
+            )
+            return
+        (
+            device_k_data_ptrs,
+            device_v_data_ptrs,
+            device_k_buffers,
+            device_v_buffers,
+        ) = self._resolve_device_transfer_buffers(device_pool)
+        device_kv_buffers = device_k_buffers + device_v_buffers
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -486,20 +562,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
-                )
-            else:
-                raise ValueError(f"Unsupported layout: {self.layout}")
-        elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
-                    host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
-                    host_v=self.v_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.D2H,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1168,6 +1230,15 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         *,
         is_draft: bool = False,
     ):
+        if io_backend == "kernel_ascend":
+            return super().load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                is_draft=is_draft,
+            )
         if self.device_pool is not None:
             if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
                 return
@@ -1233,6 +1304,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if io_backend == "kernel_ascend":
+            return super().backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )
         (
             device_k_data_ptrs,
             device_v_data_ptrs,
