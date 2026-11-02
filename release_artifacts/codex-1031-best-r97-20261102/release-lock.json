@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "runtime_source_commit": "f4ea39f662ab6fff24c9f4cc9fd3b1431d3969bf",
+  "baseline_commit": "73a2cbb65555d303c1836411edfe7dd9400eaa82",
+  "qualified_image": "sha256:0e87d41c14db6b258376dafc160ec71345bb636abe5ffeb017f9d3e8f4ddb8f1",
+  "qualified_image_archive_sha256": "72836b4c22ed4f57d89f3402852d6dd3a6c51b48a2f017beb5a363a1f572dcb3",
+  "qualification": {
+    "completed": 2000,
+    "single_card_qps": 10.734203619416151,
+    "request_throughput": 85.87362895532921,
+    "mean_e2e_latency_ms": 1445.5429924204946,
+    "duration": 23.290037050144747,
+    "slo_pass": true,
+    "measurement_valid": true,
+    "guard_policy": "full_run_mean_after_2000"
+  },
+  "package": {
+    "version": "0.5.19+codex1031.g73a2cbb6",
+    "wheel": "sglang-0.5.19+codex1031.g73a2cbb6-py3-none-any.whl",
+    "sha256": "e7ae9b3eaefcf0a9ee3c942e1e976f38bc92c75505c5eb7ea21fb960189c3159",
+    "runtime_files_exact": 4680,
+    "rust_extension_build": "none; matches qualified runtime",
+    "packaging_only_changes": [
+      "explicit local version in staged pyproject",
+      "no setuptools-scm build dependency",
+      "include every frozen package runtime file"
+    ]
+  },
+  "runtime_manifest_sha256": "f4c8647bc8dc6339a36f2e38b92edcff10d6aecd819e6b7655310eca708615bb",
+  "device_code_rebuilt": false,
+  "reproduce_exact_binary": "Install the hash-pinned wheel with --no-index --no-deps; source identity alone does not imply byte-identical rebuilt binaries.",
+  "disabled_in_qualified_release": [
+    "SGLANG_NPU_GMM1_COUNTS",
+    "SGLANG_NPU_PD_PREFILL_EARLY_RESULT"
+  ],
+  "feature_commits": [
+    {
+      "feature": "GMM1 counts (disabled)",
+      "commit": "60088bb15acfd7781149108b1163a0f4957a2f08",
+      "CPU_test": {
+        "exit_code": 0,
+        "log": "/mnt/sfs_turbo/hxd/p_kv_shared_tune_test/codex-1031/image-release/sglang-codex1031-best-r97-20261102-001/freeze-counts-cpu-test.log"
+      }
+    },
+    {
+      "feature": "early prefill results (disabled)",
+      "commit": "f4ea39f662ab6fff24c9f4cc9fd3b1431d3969bf",
+      "CPU_test": {
+        "exit_code": 0,
+        "log": "/mnt/sfs_turbo/hxd/p_kv_shared_tune_test/codex-1031/image-release/sglang-codex1031-best-r97-20261102-001/freeze-early-prefill-cpu-test.log"
+      }
+    }
+  ],
+  "generated_version_snapshot": {
+    "path": "generated/sglang/_version.py",
+    "sha256": "d9cd84a859bc19ca3c9e9f8e1c7d0337afd31d3f1e3e581a21bf6518943b8529",
+    "normal_source_location_is_gitignored": true
+  }
+}
