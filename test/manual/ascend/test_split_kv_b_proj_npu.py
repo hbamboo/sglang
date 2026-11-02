@@ -28,6 +28,9 @@ import math
 import torch
 import torch_npu
 
+import split_kv_test_utils as tu
+
+tu.assert_npu5_idle()
 torch.npu.set_device(0)
 
 from sglang.srt.hardware_backend.npu.modules import (
@@ -35,8 +38,6 @@ from sglang.srt.hardware_backend.npu.modules import (
 )
 from sglang.srt.hardware_backend.npu.modules import split_kv_b_proj as skv
 from sglang.srt.layers.linear import ColumnParallelLinear
-
-import split_kv_test_utils as tu
 
 DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 TOL = {torch.bfloat16: (0.5, 2e-2), torch.float16: (0.05, 1e-2)}

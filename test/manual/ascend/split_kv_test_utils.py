@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -17,6 +18,42 @@ FRAMEWORK = "/mnt/sfs_turbo/hxd/split-kv-matmul-20261102/framework"
 RESULTS_DIR = os.environ.get(
     "SPLIT_KV_RESULTS_DIR", "/mnt/sfs_turbo/hxd/split-kv-matmul-20261102/results"
 )
+
+
+def assert_npu5_idle() -> str:
+    """Fail fast unless physical NPU5 has no active process/utilization."""
+    out = subprocess.run(
+        "npu-smi info", shell=True, capture_output=True, text=True, timeout=30
+    ).stdout
+    lines = out.splitlines()
+    idx = next(
+        (i for i, line in enumerate(lines) if line.startswith("| 5 ")), None
+    )
+    if idx is None:
+        raise RuntimeError(f"physical NPU5 row not found in npu-smi:\n{out}")
+    board = "\n".join(lines[idx : idx + 2])
+    ratio = re.search(
+        r"\|\s*NA\s*\|\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s+(\d+)\s*/\s*(\d+)", board
+    )
+    if ratio is None:
+        raise RuntimeError(f"cannot parse physical NPU5 npu-smi row:\n{out}")
+    util, hbm_used, hbm_total = int(ratio.group(1)), int(ratio.group(4)), int(ratio.group(5))
+    if util != 0 or hbm_used * 5 >= hbm_total:
+        raise RuntimeError(
+            f"physical NPU5 is not idle: util={util}% HBM={hbm_used}/{hbm_total} MB"
+        )
+    process_section = out.split("Process id", 1)
+    if len(process_section) == 2:
+        busy = [
+            line
+            for line in process_section[1].splitlines()
+            if line.startswith("| 5 ")
+            and str(os.getpid()) not in line  # our own process, if already mapped
+        ]
+        if busy:
+            raise RuntimeError(f"physical NPU5 has active processes: {busy}")
+    return board
+
 SOURCE_FILES = [
     f"{FRAMEWORK}/python/sglang/srt/hardware_backend/npu/modules/split_kv_b_proj.py",
     f"{FRAMEWORK}/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py",

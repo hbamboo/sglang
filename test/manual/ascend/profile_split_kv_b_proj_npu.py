@@ -27,11 +27,13 @@ os.environ["SGLANG_NPU_SPLIT_KV_B_PROJ"] = "1"
 import torch
 import torch_npu
 
+import split_kv_test_utils as tu
+
+tu.assert_npu5_idle()
 torch.npu.set_device(0)
 
 from sglang.srt.hardware_backend.npu.modules import split_kv_b_proj as skv
 
-import split_kv_test_utils as tu
 import test_split_kv_b_proj_npu as T
 
 DEV = "npu:0"
