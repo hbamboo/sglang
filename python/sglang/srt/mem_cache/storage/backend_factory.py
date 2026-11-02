@@ -83,6 +83,10 @@ class StorageBackendFactory:
             ImportError: If backend module cannot be imported
             Exception: If backend initialization fails
         """
+        prepare_config = getattr(mem_pool_host, "prepare_storage_config", None)
+        if prepare_config is not None:
+            storage_config = prepare_config(backend_name, storage_config)
+
         # First check if backend is already registered
         if backend_name in cls._registry:
             registry_entry = cls._registry[backend_name]

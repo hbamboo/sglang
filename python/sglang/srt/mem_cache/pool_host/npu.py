@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from dataclasses import replace
 from typing import Optional, Sequence
 
 import torch
@@ -249,6 +251,40 @@ class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     def get_hybrid_pool_buffer(self):
         return [self.kv_buffer]
+
+    @property
+    def storage_format(self):
+        # Equal-sized unified and split pages have different byte ordering.
+        # Include every physical-format discriminator so neither layout can
+        # consume the other's persisted pages (or old CUDA/split payloads).
+        components = tuple(
+            (name, getattr(self.device_pool, name).shape[-1])
+            for name in self._component_names
+        )
+        signature = repr(
+            (
+                str(self.dtype),
+                self.page_size,
+                self.layer_num,
+                self.start_layer,
+                self.end_layer,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                components,
+            )
+        )
+        return "ascend-mla-v1-" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+
+    def prepare_storage_config(self, backend_name, storage_config):
+        if backend_name != "file":
+            raise NotImplementedError(
+                "Ascend MLA HiCache currently supports only the 'file' L3 backend; "
+                "omit --hicache-storage-backend for device/host caching"
+            )
+        return replace(
+            storage_config,
+            model_name=f"{storage_config.model_name or ''}--{self.storage_format}",
+        )
 
     def get_contiguous_buf_infos(self):
         # This is storage registration of the complete host allocation. It is
