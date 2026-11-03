@@ -91,6 +91,8 @@ class Patches:
             "backend": True,
             "nz": False,
             "scatter": False,
+            "parallel": True,
+            "npu": True,
         }
         self.flags.update(flags)
         self.saved = []
@@ -103,6 +105,8 @@ class Patches:
             ("_backend_is_supported", lambda backend: f["backend"]),
             ("_pa_nz_active", lambda: f["nz"]),
             ("_scatter_active", lambda: f["scatter"]),
+            ("_parallel_tp1", lambda: f["parallel"]),
+            ("_npu_tensor_ok", lambda tensor: f["npu"]),
         ):
             self.saved.append((name, getattr(fas, name)))
             setattr(fas, name, value)
@@ -289,6 +293,76 @@ def test_merged_early_return_and_fia_fallback_in_real_consumer():
     print("PASS merged consumer: FAS early return, old FIA fallback intact")
 
 
+def test_plan_build_count_and_step_freshness():
+    prefix, seq = (64, 0, 128), (1, 4, 7)
+    total = sum(prefix) + sum(seq)
+    q = torch.zeros((12, 20, 256), dtype=torch.bfloat16)
+    k = torch.zeros((total, 20, 256), dtype=torch.bfloat16)
+    v = torch.zeros((total, 20, 256), dtype=torch.bfloat16)
+    kv_offsets, q_offsets, kv, qq = [], [], 0, 0
+    for p, length in zip(prefix, seq):
+        kv_offsets.append(kv)
+        q_offsets.append(qq)
+        kv += p + length
+        qq += length
+    context = SimpleNamespace(
+        prefix_lens=prefix, seq_lens=seq,
+        q_offsets=tuple(q_offsets), kv_offsets=tuple(kv_offsets),
+        total_rows=total, k_full=k, v_full=v,
+        num_heads=20, qk_head_dim=256, v_head_dim=256, layer_id=3,
+    )
+    backend, layer = make_backend(), make_layer()
+    batch = make_batch(prefix, seq)
+
+    builds = []
+    original_build = fas.build_dense_fas_plan
+
+    def counting_build(*args, **kwargs):
+        plan = original_build(*args, **kwargs)
+        builds.append(plan)
+        return plan
+
+    fake, calls = make_fake_fas()
+    saved_fas = fas._invoke_public_fas
+    fas.build_dense_fas_plan = counting_build
+    fas._invoke_public_fas = fake
+    try:
+        with Patches():
+            out1 = fas.maybe_forward_merged_dense_prefill_fas(
+                backend, q, context, layer, batch
+            )
+            plan1 = backend.forward_metadata.dense_fas_plan
+            out2 = fas.maybe_forward_merged_dense_prefill_fas(
+                backend, q, context, layer, batch
+            )
+        assert out1 is not None and out2 is not None
+        assert len(builds) == 1, "one host plan per step, not per layer"
+        assert backend.forward_metadata.dense_fas_plan is plan1
+        assert len(calls) == 2, "native FAS still runs once per layer"
+
+        # Same host key, new scheduler step (fresh ForwardMetadata): rebuild.
+        backend.forward_metadata = SimpleNamespace()
+        with Patches():
+            out3 = fas.maybe_forward_merged_dense_prefill_fas(
+                backend, q, context, layer, batch
+            )
+        assert out3 is not None and len(builds) == 2
+        assert backend.forward_metadata.dense_fas_plan is not plan1
+        assert len(calls) == 3
+
+        # FAS disabled: no host planning and no native call.
+        backend.forward_metadata = SimpleNamespace()
+        with Patches(enabled=False):
+            out4 = fas.maybe_forward_merged_dense_prefill_fas(
+                backend, q, context, layer, batch
+            )
+        assert out4 is None and len(builds) == 2 and len(calls) == 3
+    finally:
+        fas.build_dense_fas_plan = original_build
+        fas._invoke_public_fas = saved_fas
+    print("PASS plan count: once/step, fresh per new metadata, zero when disabled")
+
+
 def test_core_dispatch_keeps_gate_and_oproj():
     src = (
         REPO
@@ -374,6 +448,8 @@ def test_fallbacks_preserve_old_path():
     assert attempt(backend=False) == (None, [])
     assert attempt(nz=True) == (None, [])
     assert attempt(scatter=True) == (None, [])
+    assert attempt(parallel=False) == (None, [])
+    assert attempt(npu=False) == (None, [])
 
     # zero query in the batch
     b0 = make_batch(prefix, [3, 0, 2])
@@ -465,6 +541,7 @@ def main():
     test_merged_ragged_prefix_and_cumulative_kv()
     test_merged_early_return_and_fia_fallback_in_real_consumer()
     test_core_dispatch_keeps_gate_and_oproj()
+    test_plan_build_count_and_step_freshness()
     test_fallbacks_preserve_old_path()
     test_prepare_cache_writer_still_present()
     print("ALL DENSE PREFILL FAS CPU TESTS PASSED")

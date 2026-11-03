@@ -191,6 +191,32 @@ def _scatter_active() -> bool:
         return True
 
 
+def _parallel_tp1() -> bool:
+    """Actual runtime parallel context: single-rank TP/attention widths."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        return all(
+            getattr(parallel, width) == 1
+            for width in (
+                "world_size",
+                "tp_size",
+                "attn_tp_size",
+                "attn_dp_size",
+                "attn_cp_size",
+                "attn_dcp_size",
+            )
+        )
+    except Exception:
+        return False
+
+
+def _npu_tensor_ok(tensor: object) -> bool:
+    """Explicit NPU device guard; CPU contract fixtures patch this predicate."""
+    return torch.is_tensor(tensor) and tensor.device.type == "npu"
+
+
 def _invoke_public_fas(q, k, v, **kwargs):
     """Single dispatch point so tests can observe the public-FAS call."""
     import torch_npu
@@ -213,6 +239,8 @@ def _common_reason(
         return "graph_or_compile"
     if not _backend_is_supported(backend):
         return "backend"
+    if not _parallel_tp1():
+        return "parallel"
     try:
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -251,6 +279,8 @@ def _common_reason(
         return "geometry"
     if not (torch.is_tensor(q) and torch.is_tensor(k) and torch.is_tensor(v)):
         return "tensor"
+    if not (_npu_tensor_ok(q) and _npu_tensor_ok(k) and _npu_tensor_ok(v)):
+        return "device_type"
     if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
         return "dtype"
     if q.device != k.device or q.device != v.device:
@@ -340,17 +370,23 @@ def maybe_forward_dense_prefill_fas(
     the eligible merged context route covers prefix cases without dropping
     history.
     """
+    if not _fas_enabled():
+        return None
     prefixes = getattr(forward_batch, "extend_prefix_lens_cpu", None)
     seqs = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    host_prefixes = _host_ints(prefixes)
-    if host_prefixes is None or any(host_prefixes):
+    if prefixes is None or seqs is None:
+        return None
+    try:
+        if any(prefixes):
+            return None
+    except TypeError:
         return None
     if not torch.is_tensor(q) or not torch.is_tensor(k) or not torch.is_tensor(v):
         return None
     reason = _common_reason(backend, layer, forward_batch, q, k, v, k.shape[0])
     if reason is not None:
         return None
-    plan = _step_plan(backend, host_prefixes, seqs, q_rows=q.shape[0], kv_rows=k.shape[0])
+    plan = _step_plan(backend, prefixes, seqs, q_rows=q.shape[0], kv_rows=k.shape[0])
     if plan is None:
         return None
     return _run(backend, q, k, v, layer, plan)
@@ -369,6 +405,8 @@ def maybe_forward_merged_dense_prefill_fas(
     ``[prefix_j, current_j]`` per request in FIA order; only view/tensor checks
     and one whole-batch native call are performed.
     """
+    if not _fas_enabled():
+        return None
     try:
         prefixes = tuple(context.prefix_lens)
         seqs = tuple(context.seq_lens)
@@ -381,21 +419,18 @@ def maybe_forward_merged_dense_prefill_fas(
         return None
     if not torch.is_tensor(q) or not torch.is_tensor(k_full) or not torch.is_tensor(v_full):
         return None
-    built = build_dense_fas_plan(
-        prefixes, seqs, q_rows=q.shape[0], kv_rows=kv_rows
-    )
-    if built is None:
-        return None
-    # Context offsets are interval STARTS; both must be the contiguous layout
-    # implied by the host lengths (no gaps, no overlap, request order).
-    q_starts = (0,) + built.q_cumulative[:-1]
-    kv_starts = (0,) + built.kv_cumulative[:-1]
-    if q_starts != q_offsets or kv_starts != kv_offsets:
-        return None
     reason = _common_reason(backend, layer, forward_batch, q, k_full, v_full, kv_rows)
     if reason is not None:
         return None
+    # The host plan is built at most once per scheduler step (cached in the
+    # fresh ForwardMetadata); this call reuses it for every layer.
     plan = _step_plan(backend, prefixes, seqs, q_rows=q.shape[0], kv_rows=kv_rows)
     if plan is None:
+        return None
+    # Context offsets are interval STARTS; both must be the contiguous layout
+    # implied by the cached host plan (no gaps, no overlap, request order).
+    q_starts = (0,) + plan.q_cumulative[:-1]
+    kv_starts = (0,) + plan.kv_cumulative[:-1]
+    if q_starts != q_offsets or kv_starts != kv_offsets:
         return None
     return _run(backend, q, k_full, v_full, layer, plan)
