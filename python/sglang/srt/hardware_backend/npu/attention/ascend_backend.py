@@ -31,6 +31,10 @@ from sglang.srt.hardware_backend.npu.attention import (
 from sglang.srt.hardware_backend.npu.modules.prefix_gather_unified_cache_npu import (
     maybe_gather_unified_prefix_kv,
 )
+from sglang.srt.hardware_backend.npu.modules.prefix_kv_b_proj_npu import (
+    MergedPrefixKVProjection,
+    iter_fia_request_slices,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -645,6 +649,92 @@ class AscendAttnBackend(AttentionBackend):
             next_tokens=0,
             out=[out, softmax_lse],
         )
+
+    def forward_merged_prefix_kv(
+        self,
+        q: torch.Tensor,
+        context: MergedPrefixKVProjection,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Attention for the opt-in merged prefix/current KV-B projection.
+
+        ``context.k_full`` / ``context.v_full`` already hold every request's
+        ``[prefix, current]`` tokens in contiguous intervals, so the original
+        per-request sequence-axis K/V concatenations are replaced by views.
+        Query slices stay the new-token rows, and the FIA call (sparse mode 3,
+        mask, scaling, head counts, direct-output eligibility) is the original
+        one.
+        """
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_full = context.k_full
+        v_full = context.v_full
+        if (
+            k_full.shape != (context.total_rows, layer.tp_q_head_num, layer.qk_head_dim)
+            or v_full.shape
+            != (context.total_rows, layer.tp_q_head_num, layer.v_head_dim)
+        ):
+            raise RuntimeError(
+                "merged prefix KV context shapes do not match the layer: "
+                f"K={tuple(k_full.shape)} V={tuple(v_full.shape)} "
+                f"rows={context.total_rows} q_heads={layer.tp_q_head_num} "
+                f"qk={layer.qk_head_dim} v={layer.v_head_dim}"
+            )
+        if context.num_heads != layer.tp_k_head_num:
+            raise RuntimeError(
+                "merged prefix KV head count does not match the layer: "
+                f"context={context.num_heads} tp_k_heads={layer.tp_k_head_num}"
+            )
+        if context.layer_id != layer.layer_id:
+            raise RuntimeError(
+                "merged prefix KV context belongs to another layer: "
+                f"{context.layer_id} != {layer.layer_id}"
+            )
+
+        attn_output = torch.empty(
+            (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        fia_direct = self._can_use_fia_direct_output(q)
+        for _req_idx, q_start, kv_start, kv_end, q_len in iter_fia_request_slices(
+            context
+        ):
+            if q_len == 0:
+                # No query tokens to submit; offsets already account for this
+                # request's prefix block and the (empty) query slice.
+                continue
+            query = q[None, q_start : q_start + q_len]
+            key = k_full[kv_start:kv_end].unsqueeze(0)
+            value = v_full[kv_start:kv_end].unsqueeze(0)
+            if fia_direct:
+                self._fia_bsnd_prefill_out(
+                    query,
+                    key,
+                    value,
+                    attn_output[q_start : q_start + q_len].unsqueeze(0),
+                    self.fia_mask,
+                    3,
+                    layer.scaling,
+                    layer.tp_q_head_num,
+                    layer.tp_k_head_num,
+                )
+            else:
+                attn_output[q_start : q_start + q_len] = (
+                    torch.ops.npu.npu_fused_infer_attention_score(
+                        query,
+                        key,
+                        value,
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                        atten_mask=self.fia_mask,
+                        sparse_mode=3,
+                        scale=layer.scaling,
+                        next_tokens=0,
+                    )[0]
+                )
+        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

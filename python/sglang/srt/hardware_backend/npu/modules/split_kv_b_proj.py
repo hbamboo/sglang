@@ -404,15 +404,18 @@ def _expanded_kv_may_fuse(forward_batch: object) -> bool:
         return True
 
 
-def maybe_forward_split_kv_b_proj(
+def split_kv_b_proj_state_for_forward(
     attn: object,
     module: object,
-    kv_a: torch.Tensor,
     forward_batch: object = None,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Return contiguous ``(k_nope[T,H,Dk], v[T,H,Dv])`` or ``None``.
+) -> Optional[SplitKVBProjState]:
+    """Host-metadata readiness for the split path, without running a GEMM.
 
-    ``None`` means the caller must run the original one-matmul path.
+    Every guard that does not depend on the input tensor lives here so callers
+    (the merged prefix/current route) can decide eligibility before doing any
+    gather/pack work.  ``maybe_forward_split_kv_b_proj`` re-runs the same
+    checks, then validates the input tensor; the original behaviour and the
+    stale-weight protection are unchanged.
     """
     state = getattr(module, _STATE_ATTR, None) if module is not None else None
     if state is None:
@@ -420,9 +423,6 @@ def maybe_forward_split_kv_b_proj(
     # Dynamo/capture must be rejected before touching data_ptr/_version, which
     # are not traceable and would otherwise graph-break before the fallback.
     if _capture_or_compile_active():
-        return None
-    # Empty batches have nothing to save; keep the single empty matmul.
-    if not isinstance(kv_a, torch.Tensor) or kv_a.numel() == 0:
         return None
     if not _state_is_current(state, module):
         return None
@@ -434,13 +434,41 @@ def maybe_forward_split_kv_b_proj(
         return None
     if _expanded_kv_may_fuse(forward_batch):
         return None
+    return state
+
+
+def split_kv_b_proj_input_supported(
+    kv_a: object, state: SplitKVBProjState
+) -> bool:
+    """Whether ``kv_a`` can feed the two prepared GEMMs unchanged."""
+    # Empty batches have nothing to save; keep the single empty matmul.
+    if not isinstance(kv_a, torch.Tensor) or kv_a.numel() == 0:
+        return False
     if kv_a.dim() < 1 or kv_a.shape[-1] != state.input_size:
-        return None
+        return False
     if kv_a.dtype != state.weight_dtype or kv_a.device != state.weight_device:
-        return None
+        return False
     # A strided kv_a would make both GEMMs materialize an input copy; keep the
     # original single projection on that unverified shape.
     if not kv_a.is_contiguous():
+        return False
+    return True
+
+
+def maybe_forward_split_kv_b_proj(
+    attn: object,
+    module: object,
+    kv_a: torch.Tensor,
+    forward_batch: object = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Return contiguous ``(k_nope[T,H,Dk], v[T,H,Dv])`` or ``None``.
+
+    ``None`` means the caller must run the original one-matmul path.
+    """
+    state = split_kv_b_proj_state_for_forward(attn, module, forward_batch)
+    if state is None:
+        return None
+    if not split_kv_b_proj_input_supported(kv_a, state):
         return None
 
     k_nope = torch.nn.functional.linear(kv_a, state.w_k, state.b_k)

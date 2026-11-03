@@ -21,6 +21,10 @@ from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
     can_fuse_expanded_kv,
     forward_expanded_prefill,
 )
+from sglang.srt.hardware_backend.npu.modules.prefix_kv_b_proj_npu import (
+    MergedPrefixKVProjection,
+    maybe_merge_prefix_kv_b_proj,
+)
 from sglang.srt.hardware_backend.npu.modules.q_latent_rmsnorm_mxquant import (
     forward_q_latent_rmsnorm_mxquant,
 )
@@ -113,6 +117,9 @@ def forward_mha_prepare_npu(
     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
+    # Whether the unified 576-wide writer produced the current normalized
+    # latent (``kv_a``) and rotated K-RoPE rows used by the opt-in merge below.
+    unified_cache_ready = False
     if m.use_deepseek_yarn_rope:
         B, S = q.shape[0], 1
         cos, sin = get_mha_rope_cos_sin(
@@ -145,6 +152,7 @@ def forward_mha_prepare_npu(
         )
         if unified_out is not None:
             k_pe, kv_a = unified_out
+            unified_cache_ready = True
         else:
             ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
             _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -176,6 +184,24 @@ def forward_mha_prepare_npu(
         )
 
     q[..., m.qk_nope_head_dim :] = q_pe
+
+    # Narrow opt-in (default off): gather the cache-hit prefix now, pack it with
+    # the current rows in per-request [prefix, current] order, and project ALL
+    # rows with the existing split KV-B GEMMs.  On success the old current-only
+    # two-GEMM block below is skipped and the backend consumes the full K/V
+    # through the explicit per-call context; otherwise every original route is
+    # retained verbatim.
+    merged_prefix_kv = maybe_merge_prefix_kv_b_proj(
+        m,
+        m.kv_b_proj,
+        kv_a,
+        k_pe,
+        q,
+        forward_batch,
+        unified_cache_ready=unified_cache_ready,
+    )
+    if merged_prefix_kv is not None:
+        return q, merged_prefix_kv, None, forward_batch
 
     split_kv = maybe_forward_split_kv_b_proj(m, m.kv_b_proj, kv_a, forward_batch)
     if split_kv is not None:
@@ -218,6 +244,17 @@ def forward_mha_core_npu(
                 forward_batch,
                 packed_kv=k,
             )
+    elif isinstance(k, MergedPrefixKVProjection):
+        # Dedicated consumer for the opt-in merged prefix/current KV-B route.
+        # RadixAttention's Tensor ``.view`` contract is bypassed only here; the
+        # context was validated against this backend before prepare returned.
+        consumer = getattr(get_attn_backend(), "forward_merged_prefix_kv", None)
+        if consumer is None:
+            raise RuntimeError(
+                "merged prefix KV-B context produced for an attention backend "
+                "without a merged-prefix consumer"
+            )
+        attn_output = consumer(q, k, m.attn_mha, forward_batch)
     else:
         attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
