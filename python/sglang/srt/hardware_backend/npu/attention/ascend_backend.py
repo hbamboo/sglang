@@ -28,6 +28,9 @@ from sglang.srt.hardware_backend.npu.attention import (
 from sglang.srt.hardware_backend.npu.attention import (
     flash_mla_adapter as fmla_adapter,
 )
+from sglang.srt.hardware_backend.npu.modules.prefix_gather_unified_cache_npu import (
+    maybe_gather_unified_prefix_kv,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -2263,14 +2266,22 @@ class AscendAttnBackend(AttentionBackend):
             if layer.qk_head_dim == layer.v_head_dim:
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                kv_cached = torch.index_select(
-                    k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+                _gathered = maybe_gather_unified_prefix_kv(
+                    self.token_to_kv_pool,
+                    layer.layer_id,
+                    self.forward_metadata.flatten_prefix_block_tables,
                 )
-                k_rope_cached = torch.index_select(
-                    v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-                ).flatten(0, 1)
+                if _gathered is None:
+                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    kv_cached = torch.index_select(
+                        k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+                    )
+                    k_rope_cached = torch.index_select(
+                        v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+                    ).flatten(0, 1)
+                else:
+                    kv_cached, k_rope_cached = _gathered
 
                 assert layer.kv_b_proj is not None
                 kv = layer.kv_b_proj(kv_cached)[0].view(
@@ -2394,14 +2405,22 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
                 # 2nd, load history kvcache(kv_a and k_pe) and calculate k_nope
-                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                kv_cached = torch.index_select(
-                    k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+                _gathered = maybe_gather_unified_prefix_kv(
+                    self.token_to_kv_pool,
+                    layer.layer_id,
+                    self.forward_metadata.flatten_prefix_block_tables,
                 )
-                k_rope_cached = torch.index_select(
-                    v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-                ).flatten(0, 1)
+                if _gathered is None:
+                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    kv_cached = torch.index_select(
+                        k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+                    )
+                    k_rope_cached = torch.index_select(
+                        v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+                    ).flatten(0, 1)
+                else:
+                    kv_cached, k_rope_cached = _gathered
 
                 assert layer.kv_b_proj is not None
                 kv = layer.kv_b_proj(kv_cached)[0].view(
