@@ -109,6 +109,21 @@ _NPU_GLM_PREFILL_QKV_NORM_FUSION = _is_npu and get_bool_env_var(
     "SGLANG_NPU_GLM_PREFILL_QKV_NORM_FUSION", "0"
 )
 
+# Opt-in for a single-process mixed prefill+decode server (disaggregation_mode
+# "null"). It never enables a PD decode role: the consumer below still requires
+# eager EXTEND with no speculative/capture/TBO/compile/DP/CP.
+_NPU_MIXED_PREFILL_OPT = _is_npu and get_bool_env_var(
+    "SGLANG_NPU_MIXED_PREFILL_OPT", "0"
+)
+
+
+def _prefill_or_mixed_opt_role() -> bool:
+    """Original PD prefill, or the explicit mixed-process opt-in under "null"."""
+    mode = get_disagg().disaggregation_mode
+    if mode == "prefill":
+        return True
+    return mode == "null" and _NPU_MIXED_PREFILL_OPT
+
 
 def _glm_prefill_qkv_norm_consumer(layer, hidden_states, residual, forward_batch):
     """Limit the tuple producer to ordinary eager single-rank PD prefill.
@@ -132,7 +147,7 @@ def _glm_prefill_qkv_norm_consumer(layer, hidden_states, residual, forward_batch
     ):
         return None
     if (
-        get_disagg().disaggregation_mode != "prefill"
+        not _prefill_or_mixed_opt_role()
         or get_spec().speculative_algorithm is not None
         or is_dp_attention_enabled()
         or get_attn_tp_context().input_scattered

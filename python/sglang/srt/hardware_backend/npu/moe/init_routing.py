@@ -13,11 +13,25 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_disagg
+from sglang.srt.utils import get_bool_env_var
 
 # ``npu_moe_init_routing_v2`` quant_mode selecting MXFP8: the op emits an
 # float8_e4m3fn payload plus an e8m0 block scale, fusing the activation quant
 # that would otherwise need a separate ``npu_dynamic_mx_quant`` pass.
 MXFP8_QUANT_MODE = 3
+
+# Opt-in for a single-process mixed prefill+decode server (disaggregation_mode
+# "null"). It only relaxes the role test; every row/dtype/geometry guard below
+# still applies, and decode batches (<=512 rows) can never reach 8192 rows.
+_NPU_MIXED_PREFILL_OPT = get_bool_env_var("SGLANG_NPU_MIXED_PREFILL_OPT", "0")
+
+
+def _prefill_or_mixed_opt_role() -> bool:
+    """Original PD prefill, or the explicit mixed-process opt-in under "null"."""
+    mode = get_disagg().disaggregation_mode
+    if mode == "prefill":
+        return True
+    return mode == "null" and _NPU_MIXED_PREFILL_OPT
 
 
 def _normalize_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -55,7 +69,7 @@ def _can_prequantize_mxfp8(
         and topk_ids.device == hidden_states.device
         and topk_ids.is_contiguous()
         and hasattr(torch, "float8_e8m0fnu")
-        and get_disagg().disaggregation_mode == "prefill"
+        and _prefill_or_mixed_opt_role()
     )
 
 
