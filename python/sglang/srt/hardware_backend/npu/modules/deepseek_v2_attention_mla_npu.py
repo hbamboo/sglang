@@ -25,6 +25,9 @@ from sglang.srt.hardware_backend.npu.modules.prefix_kv_b_proj_npu import (
     MergedPrefixKVProjection,
     maybe_merge_prefix_kv_b_proj,
 )
+from sglang.srt.hardware_backend.npu.modules.dense_prefill_fas_npu import (
+    maybe_forward_dense_prefill_fas,
+)
 from sglang.srt.hardware_backend.npu.modules.q_latent_rmsnorm_mxquant import (
     forward_q_latent_rmsnorm_mxquant,
 )
@@ -256,7 +259,13 @@ def forward_mha_core_npu(
             )
         attn_output = consumer(q, k, m.attn_mha, forward_batch)
     else:
-        attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        dense_fas = maybe_forward_dense_prefill_fas(
+            get_attn_backend(), q, k, v, m.attn_mha, forward_batch
+        )
+        if dense_fas is not None:
+            attn_output = dense_fas
+        else:
+            attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
         attn_output = m._apply_gated(attn_output, gate)

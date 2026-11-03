@@ -35,6 +35,9 @@ from sglang.srt.hardware_backend.npu.modules.prefix_kv_b_proj_npu import (
     MergedPrefixKVProjection,
     iter_fia_request_slices,
 )
+from sglang.srt.hardware_backend.npu.modules.dense_prefill_fas_npu import (
+    maybe_forward_merged_dense_prefill_fas,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -119,6 +122,9 @@ class ForwardMetadata:
     # ForwardMetadata each step; never place these in a global cache.
     prefill_fas_decision: Optional[object] = None
     prefill_fas_staging: Optional[object] = None
+    # Eager dense-FAS per-step plan (fresh metadata per step; host-length key).
+    dense_fas_plan: Optional[object] = None
+    dense_fas_plan_key: Optional[object] = None
 
     # pre-translated full->SWA write target for SWAKVPool.set_kv_buffer
     swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -690,6 +696,12 @@ class AscendAttnBackend(AttentionBackend):
                 "merged prefix KV context belongs to another layer: "
                 f"{context.layer_id} != {layer.layer_id}"
             )
+
+        dense_fas = maybe_forward_merged_dense_prefill_fas(
+            self, q, context, layer, forward_batch
+        )
+        if dense_fas is not None:
+            return dense_fas
 
         attn_output = torch.empty(
             (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
