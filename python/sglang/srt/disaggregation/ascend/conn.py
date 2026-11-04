@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import PDRequestMetadata
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -248,7 +249,8 @@ class AscendKVManager(MooncakeKVManager):
 
 
 class AscendKVSender(MooncakeKVSender):
-    pass
+    def set_host_metadata(self, metadata: PDRequestMetadata) -> None:
+        self.host_metadata = metadata
 
 
 class AscendKVReceiver(MooncakeKVReceiver):

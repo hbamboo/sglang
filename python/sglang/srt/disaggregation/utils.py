@@ -9,7 +9,9 @@ from typing import (
     Iterable,
     List,
     Literal,
+    NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     Type,
     overload,
@@ -177,21 +179,39 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
+class PDRequestMetadata(NamedTuple):
+    bootstrap_room: int
+    output_id: int
+    cached_tokens: int
+    cached_tokens_device: int
+    cached_tokens_host: int
+    cached_tokens_storage: int
+    mm_image_tokens: int
+    mm_audio_tokens: int
+    mm_video_tokens: int
+
+
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
     ranks naturally prevents any rank from committing before all ranks are ready.
     """
+    device_checks = []
     for i, poll_val in enumerate(polls):
-        if poll_val == int(KVPoll.Success):
-            decode_req = decode_reqs[i]
-            if _is_fake_transfer(decode_req.req):
-                continue
-            actual_room = metadata_buffers.bootstrap_room[
-                decode_req.metadata_buffer_index, 0
-            ].item()
-            if actual_room == 0:
+        if poll_val != int(KVPoll.Success):
+            continue
+        decode_req = decode_reqs[i]
+        if _is_fake_transfer(decode_req.req):
+            continue
+        # A negotiated host record is published with the transfer completion.
+        if getattr(decode_req.kv_receiver, "host_metadata", None) is None:
+            device_checks.append((i, decode_req.metadata_buffer_index))
+
+    if device_checks:
+        positions, slots = zip(*device_checks)
+        for i, room in zip(positions, metadata_buffers.read_bootstrap_rooms(slots)):
+            if room == 0:
                 polls[i] = int(KVPoll.Transferring)
 
 
@@ -280,6 +300,7 @@ class ReqToMetadataIdxAllocator:
     ):
         self.size = size
         self.free_slots = deque(list(range(size)))
+        self._reset_events: dict[int, torch.npu.Event] = {}
 
     def available_size(self):
         return len(self.free_slots)
@@ -288,10 +309,22 @@ class ReqToMetadataIdxAllocator:
         if len(self.free_slots) == 0:
             return None
 
-        return self.free_slots.popleft()
+        index = self.free_slots.popleft()
+        event = self._reset_events.pop(index, None)
+        # The next owner can advertise this slot to a remote writer immediately.
+        if event is not None and not event.query():
+            event.synchronize()
+        return index
 
     def free(self, free_index: int):
         self.free_slots.append(free_index)
+
+    def free_after_reset(
+        self, slots: list[int], event: Optional[torch.npu.Event]
+    ) -> None:
+        if event is not None:
+            self._reset_events.update((slot, event) for slot in slots)
+        self.free_slots.extend(slots)
 
 
 class MetadataBuffers:
@@ -386,6 +419,58 @@ class MetadataBuffers:
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
+    def read_bootstrap_rooms(self, slots: Sequence[int]) -> list[int]:
+        if len(slots) == 1 or self.bootstrap_room.device.type != "npu":
+            return [self.bootstrap_room[slot, 0].item() for slot in slots]
+        indices = torch.tensor(
+            slots, dtype=torch.long, device=self.bootstrap_room.device
+        )
+        return self.bootstrap_room[:, 0].index_select(0, indices).cpu().tolist()
+
+    def read_request_metadata(
+        self, slots: Sequence[int]
+    ) -> list[PDRequestMetadata]:
+        if len(slots) == 1 or self.bootstrap_room.device.type != "npu":
+            return [
+                PDRequestMetadata(
+                    self.bootstrap_room[slot, 0].item(),
+                    self.output_ids[slot, 0].item(),
+                    *self.cached_tokens[slot, :7].tolist(),
+                )
+                for slot in slots
+            ]
+
+        indices = torch.tensor(
+            slots, dtype=torch.long, device=self.bootstrap_room.device
+        )
+        packed = torch.cat(
+            (
+                self.bootstrap_room[:, :1].index_select(0, indices),
+                self.output_ids[:, :1].index_select(0, indices),
+                self.cached_tokens[:, :7].index_select(0, indices),
+            ),
+            dim=1,
+        )
+        return [PDRequestMetadata(*row) for row in packed.cpu().tolist()]
+
+    def clear_bootstrap_rooms(self, slots: list[int]) -> Optional[torch.npu.Event]:
+        if not slots:
+            return None
+        is_npu_buffer = self.bootstrap_room.device.type == "npu"
+        if len(slots) > 1 and is_npu_buffer:
+            indices = torch.tensor(
+                slots, dtype=torch.long, device=self.bootstrap_room.device
+            )
+            self.bootstrap_room.index_fill_(0, indices, 0)
+        else:
+            for slot in slots:
+                self.bootstrap_room[slot] = 0
+        if not is_npu_buffer:
+            return None
+        event = torch.npu.Event()
+        event.record()
+        return event
+
     def get_buf_infos(self):
         bufs = [
             self.output_ids,
@@ -447,7 +532,7 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
+    def set_buf(self, req: Req) -> PDRequestMetadata:
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -563,8 +648,18 @@ class MetadataBuffers:
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
+        room = req.bootstrap_room if req.bootstrap_room is not None else 0
+        self.bootstrap_room[req.metadata_buffer_index, 0] = room
+        return PDRequestMetadata(
+            room,
+            req.output_ids[0],
+            req.cached_tokens,
+            req.cached_tokens_device,
+            req.cached_tokens_host,
+            req.cached_tokens_storage,
+            image_t,
+            audio_t,
+            video_t,
         )
 
 

@@ -1221,7 +1221,18 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            metadata = self.disagg_metadata_buffers.set_buf(req)
+            if (
+                envs.SGLANG_NPU_PD_HOST_METADATA.get()
+                and self.spec_algorithm.is_none()
+                and not req.return_logprob
+                and not req.return_sampling_mask
+            ):
+                set_host_metadata = getattr(
+                    req.disagg_kv_sender, "set_host_metadata", None
+                )
+                if set_host_metadata is not None:
+                    set_host_metadata(metadata)
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request

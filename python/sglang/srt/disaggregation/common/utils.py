@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -12,6 +12,10 @@ from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
 )
+
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.utils import PDRequestMetadata
 
 
 @dataclasses.dataclass
@@ -34,6 +38,7 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
+    host_metadata: Optional["PDRequestMetadata"] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

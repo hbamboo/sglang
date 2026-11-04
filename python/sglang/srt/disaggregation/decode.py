@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    PDRequestMetadata,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
@@ -1515,6 +1516,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            if (
+                self.transfer_backend == TransferBackend.ASCEND
+                and envs.SGLANG_NPU_PD_HOST_METADATA.get()
+                and self.scheduler.spec_algorithm.is_none()
+                and not decode_req.req.return_logprob
+                and not decode_req.req.return_sampling_mask
+                and not _is_fake_transfer(decode_req.req)
+            ):
+                metadata_kwargs["request_host_metadata"] = True
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -2056,27 +2066,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+    def _commit_transfer_to_req(
+        self, decode_req: DecodeRequest, metadata: Optional[PDRequestMetadata] = None
+    ):
         idx = decode_req.metadata_buffer_index
-        (
-            output_id,
-            cached_tokens,
-            output_token_logprobs_val,
-            output_token_logprobs_idx,
-            output_top_logprobs_val,
-            output_top_logprobs_idx,
-            output_token_sampling_mask_len,
-            output_token_sampling_mask_idx,
-            output_token_sampling_logprobs,
-            output_topk_p,
-            output_topk_index,
-            output_hidden_states,
-            output_dsa_topk_indices,
-            output_bootstrap_room,
-        ) = self.metadata_buffers.get_buf(idx)
+        if metadata is None:
+            metadata = self.metadata_buffers.read_request_metadata([idx])[0]
 
-        # Validate bootstrap_room to detect context corruption
-        actual_room = output_bootstrap_room[0].item()
+        # Validate bootstrap_room to detect context corruption.
+        actual_room = metadata.bootstrap_room
         expected_room = (
             decode_req.req.bootstrap_room
             if decode_req.req.bootstrap_room is not None
@@ -2143,9 +2141,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
         else:
-            committed_output_id = output_id[0].item()
+            committed_output_id = metadata.output_id
         decode_req.req.output_ids.append(committed_output_id)
-        decode_req.req.cached_tokens = cached_tokens[0].item()
+        decode_req.req.cached_tokens = metadata.cached_tokens
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
         # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
@@ -2153,14 +2151,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # double-counting the shared prompt prefix (which would make
         # cached_tokens exceed prompt_tokens when decode radix cache is on).
         decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        decode_req.req.cached_tokens_device = metadata.cached_tokens_device
+        decode_req.req.cached_tokens_host = metadata.cached_tokens_host
+        decode_req.req.cached_tokens_storage = metadata.cached_tokens_storage
+        decode_req.req.mm_image_tokens = metadata.mm_image_tokens
+        decode_req.req.mm_audio_tokens = metadata.mm_audio_tokens
+        decode_req.req.mm_video_tokens = metadata.mm_video_tokens
+        if (
+            not self.spec_algorithm.is_none()
+            or decode_req.req.return_logprob
+            or decode_req.req.return_sampling_mask
+        ):
+            (
+                _,
+                _,
+                output_token_logprobs_val,
+                output_token_logprobs_idx,
+                output_top_logprobs_val,
+                output_top_logprobs_idx,
+                output_token_sampling_mask_len,
+                output_token_sampling_mask_idx,
+                output_token_sampling_logprobs,
+                output_topk_p,
+                output_topk_index,
+                output_hidden_states,
+                output_dsa_topk_indices,
+                _,
+            ) = self.metadata_buffers.get_buf(idx)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -2260,6 +2277,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             polls = self._poll_with_metadata_gate()
 
+        metadata_by_index = {}
+        device_reads = []
+        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            if poll != KVPoll.Success:
+                continue
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if (
+                self.scheduler.enable_decode_hicache
+                and decode_req.hicache_restore_status
+                in (HiCacheRestoreResult.PENDING, HiCacheRestoreResult.FAILED)
+            ):
+                continue
+            metadata = getattr(decode_req.kv_receiver, "host_metadata", None)
+            if metadata is not None:
+                metadata_by_index[i] = metadata
+            elif self.metadata_buffers.bootstrap_room.device.type == "npu":
+                device_reads.append((i, decode_req.metadata_buffer_index))
+        if device_reads:
+            positions, slots = zip(*device_reads)
+            metadata_by_index.update(
+                zip(positions, self.metadata_buffers.read_request_metadata(slots))
+            )
+
         transferred_reqs = []
         indices_to_remove = set()
         # Queue-removed but held for deferred release; excluded from the metadata
@@ -2328,7 +2369,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
-                self._commit_transfer_to_req(decode_req)
+                self._commit_transfer_to_req(decode_req, metadata_by_index.get(i))
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -2355,6 +2396,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+        released_slots = []
         for i in indices_to_remove:
             if i in deferred_indices:
                 # Held for deferred release; metadata buffer freed at resolve time.
@@ -2367,16 +2409,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
-            # Reset so the next owner sees actual_room == 0 ("not yet written")
-            # instead of the stale value, avoiding a false-positive mismatch.
-            self.metadata_buffers.bootstrap_room[idx] = 0
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            released_slots.append(idx)
+
+        self._release_metadata_slots(released_slots)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
         return transferred_reqs
+
+    def _release_metadata_slots(self, slots: list[int]) -> None:
+        reset = self.metadata_buffers.clear_bootstrap_rooms(slots)
+        self.req_to_metadata_buffer_idx_allocator.free_after_reset(slots, reset)
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         deadline = time.monotonic() + self.deferred_kv_release_timeout
@@ -2393,8 +2438,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-        self.metadata_buffers.bootstrap_room[idx] = 0
-        self.req_to_metadata_buffer_idx_allocator.free(idx)
+        self._release_metadata_slots([idx])
         decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None

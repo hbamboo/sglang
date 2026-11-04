@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    PDRequestMetadata,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
@@ -73,6 +74,10 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+_HOST_METADATA_V1 = b"PD_META_V1"
+_HOST_METADATA_KEY_SIZE = len(_HOST_METADATA_V1) + 16
+_HOST_METADATA_PAYLOAD = struct.Struct("!9q")
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -93,6 +98,7 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    host_metadata_key: bytes = b""
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -125,6 +131,13 @@ class TransferInfo:
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
                 else None
+            ),
+            host_metadata_key=(
+                msg[10]
+                if len(msg) > 10
+                and len(msg[10]) == _HOST_METADATA_KEY_SIZE
+                and msg[10].startswith(_HOST_METADATA_V1)
+                else b""
             ),
         )
 
@@ -217,6 +230,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self._host_metadata_receivers: dict[int, MooncakeKVReceiver] = {}
         self.enable_trace = get_observability().enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
@@ -1629,18 +1643,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
-        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        status: int,
+        prefill_rank: int,
+        host_metadata_payload: bytes = b"",
     ):
         na = NetworkAddress(remote, dst_port)
-        self._send_multipart_locked(
-            na.to_tcp(),
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
+        frames = [
+            str(room).encode("ascii"),
+            str(status).encode("ascii"),
+            str(prefill_rank).encode("ascii"),
+        ]
+        if host_metadata_payload:
+            frames.append(host_metadata_payload)
+        self._send_multipart_locked(na.to_tcp(), frames, is_ipv6=na.is_ipv6)
+
+    def _receive_host_metadata(self, room: int, payload: bytes) -> None:
+        receiver = self._host_metadata_receivers.get(room)
+        if (
+            receiver is None
+            or len(payload) != _HOST_METADATA_KEY_SIZE + _HOST_METADATA_PAYLOAD.size
+            or payload[:_HOST_METADATA_KEY_SIZE] != receiver.host_metadata_key
+        ):
+            return
+        metadata = PDRequestMetadata(
+            *_HOST_METADATA_PAYLOAD.unpack_from(payload, _HOST_METADATA_KEY_SIZE)
         )
+        if metadata.bootstrap_room == room and room != 0:
+            receiver.host_metadata = metadata
 
     def transfer_worker(
         self,
@@ -1929,20 +1962,35 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
-                                (req.endpoint, req.dst_port, req.room)
+                                (
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    req.host_metadata_key,
+                                )
                             )
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
-                                for endpoint, dst_port, room in dst_ranks_infos:
+                                for endpoint, dst_port, room, key in dst_ranks_infos:
+                                    payload = b""
+                                    if (
+                                        status == KVPoll.Success
+                                        and key
+                                        and kv_chunk.host_metadata is not None
+                                    ):
+                                        payload = key + _HOST_METADATA_PAYLOAD.pack(
+                                            *kv_chunk.host_metadata
+                                        )
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
                                         dst_port,
                                         room,
                                         status,
                                         prefill_unique_rank,
+                                        payload,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -2181,13 +2229,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     continue
 
-                bootstrap_room, status, prefill_rank = msg
+                bootstrap_room, status, prefill_rank = msg[:3]
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
+                        if len(msg) == 4:
+                            self._receive_host_metadata(bootstrap_room, msg[3])
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
                             self.required_prefill_response_num_table[bootstrap_room]
@@ -2221,6 +2271,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        host_metadata: Optional[PDRequestMetadata] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2260,6 +2311,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                host_metadata=host_metadata,
             )
         )
 
@@ -2339,6 +2391,7 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+    host_metadata: Optional[PDRequestMetadata] = None
 
     def __init__(
         self,
@@ -2393,6 +2446,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                host_metadata=self.host_metadata,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -2448,6 +2502,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self.host_metadata_key = b""
+        self.host_metadata: Optional[PDRequestMetadata] = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self) -> bool:
@@ -2547,6 +2603,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        request_host_metadata: bool = False,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -2555,6 +2612,19 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        # This path consumes only one complete Prefill response per request.
+        if (
+            request_host_metadata
+            and not self.kv_mgr.enable_staging
+            and len(self.bootstrap_infos) == 1
+            and not self.bootstrap_infos[0]["is_dummy"]
+            and self.required_dst_info_num == 1
+            and self.kv_mgr.required_prefill_response_num_table.get(self.bootstrap_room)
+            == 1
+        ):
+            self.host_metadata_key = _HOST_METADATA_V1 + os.urandom(16)
+            self.kv_mgr._host_metadata_receivers[self.bootstrap_room] = self
 
         self.chunk_staging_infos = []
         if (
@@ -2590,6 +2660,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
+                            *(
+                                [self.host_metadata_key]
+                                if self.host_metadata_key
+                                else []
+                            ),
                         ]
                     )
             except zmq.ZMQError:
@@ -2602,6 +2677,14 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
+
+    def clear(self) -> None:
+        if self.host_metadata_key:
+            receivers = self.kv_mgr._host_metadata_receivers
+            if receivers.get(self.bootstrap_room) is self:
+                receivers.pop(self.bootstrap_room)
+        self.host_metadata = None
+        super().clear()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
