@@ -315,10 +315,12 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
             elif backend == "pytorch":
-                # A slower fallback implementation with torch native operations.
+                top_ks = (
+                    sampling_info.top_ks if sampling_info.need_top_k_sampling else None
+                )
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                     probs,
-                    sampling_info.top_ks,
+                    top_ks,
                     sampling_info.top_ps,
                     sampling_info.min_ps,
                     sampling_info.need_min_p_sampling,
@@ -487,9 +489,10 @@ class Sampler(nn.Module):
             assert (
                 self.use_ascend_backend
             ), "Only ascend backend supports sampling from logits"
+            top_ks = sampling_info.top_ks if sampling_info.need_top_k_sampling else None
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
-                sampling_info.top_ks,
+                top_ks,
                 sampling_info.top_ps,
                 sampling_info.min_ps,
                 sampling_info.need_min_p_sampling,
@@ -596,7 +599,7 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
-    top_ks: torch.Tensor,
+    top_ks: Optional[torch.Tensor],
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
@@ -610,11 +613,15 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    if top_ks is not None:
+        probs_sort[
+            torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+            >= top_ks.view(-1, 1)
+        ] = 0.0
+
+    # A fixed-shape mask avoids Nonzero and its host synchronization on NPU.
+    apply_mask = probs_sort.masked_fill_ if top_ks is None else probs_sort.__setitem__
+    apply_mask((probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0)
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
@@ -622,7 +629,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
             sampling_seed is None
         ), "With sampling seed, multinomial_with_seed will provide wrong results"
         min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        apply_mask(probs_sort < min_p_thresholds.view(-1, 1), 0.0)
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
@@ -644,7 +651,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(
     logits: torch.Tensor,
-    top_ks: torch.Tensor,
+    top_ks: Optional[torch.Tensor],
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
@@ -656,8 +663,10 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     Takes temperature-scaled logits as input (softmax is applied internally).
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
-        (top_ks <= 1024) & (top_ks >= 1)
+    if (
+        top_ks is not None
+        and hasattr(torch_npu, "npu_top_k_top_p")
+        and torch.all((top_ks <= 1024) & (top_ks >= 1))
     ):
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
@@ -682,13 +691,14 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
 
-        # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
-        topk_all_mask = top_ks == TOP_K_ALL
-        top_ks.masked_fill_(topk_all_mask, probs.shape[1])
-        top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
-            1, -1
-        ) >= top_ks.view(-1, 1)
-        probs_sort.masked_fill_(top_k_mask, 0.0)
+        if top_ks is not None:
+            # Keep full-vocabulary rows unfiltered in a mixed batch.
+            topk_all_mask = top_ks == TOP_K_ALL
+            top_ks.masked_fill_(topk_all_mask, probs.shape[1])
+            top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+                1, -1
+            ) >= top_ks.view(-1, 1)
+            probs_sort.masked_fill_(top_k_mask, 0.0)
 
         probs_sum = torch.cumsum(probs_sort, dim=-1)
         top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
