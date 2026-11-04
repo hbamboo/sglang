@@ -863,7 +863,6 @@ def prepare_environment(fx):
     old = {
         "get_attn_tp_context": mha.get_attn_tp_context,
         "get_token_to_kv_pool": mha.get_token_to_kv_pool,
-        "can_fuse_expanded_kv": mha.can_fuse_expanded_kv,
         "scattered_to_tp_attn_full": mha.scattered_to_tp_attn_full,
         "_use_ag_after_qlora": mha._use_ag_after_qlora,
     }
@@ -871,7 +870,6 @@ def prepare_environment(fx):
         "Ctx", (), {"fetch_qkv_latent": lambda self: fx["qkv"]}
     )()
     mha.get_token_to_kv_pool = lambda: fx["pool"]
-    mha.can_fuse_expanded_kv = lambda *a: False
     mha.scattered_to_tp_attn_full = lambda t, fb: t
     mha._use_ag_after_qlora = False
     try:

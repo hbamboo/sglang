@@ -16,11 +16,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.modules.kv_rmsnorm_unified_cache_npu import (
     maybe_unified_kv_rmsnorm_rope_cache,
 )
-from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
-    PackedExpandedKV,
-    can_fuse_expanded_kv,
-    forward_expanded_prefill,
-)
 from sglang.srt.hardware_backend.npu.modules.prefix_kv_b_proj_npu import (
     MergedPrefixKVProjection,
     maybe_merge_prefix_kv_b_proj,
@@ -209,15 +204,10 @@ def forward_mha_prepare_npu(
     split_kv = maybe_forward_split_kv_b_proj(m, m.kv_b_proj, kv_a, forward_batch)
     if split_kv is not None:
         # Opt-in split projection: physically contiguous per-head K_nope/V.
-        # The expanded-KV packed layout is intentionally not produced here.
         k_nope, v = split_kv
     else:
         kv = m.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
-        if not m.use_dsa and can_fuse_expanded_kv(
-            get_token_to_kv_pool(), forward_batch, kv, k_pe
-        ):
-            return q, PackedExpandedKV(kv, k_pe, m.qk_nope_head_dim), None, forward_batch
         k_nope = kv[..., : m.qk_nope_head_dim]
         v = kv[..., m.qk_nope_head_dim :].contiguous()
 
@@ -236,18 +226,7 @@ def forward_mha_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if isinstance(k, PackedExpandedKV):
-        with torch.profiler.record_function("npu_prefill_expanded_kv_fused"):
-            attn_output = forward_expanded_prefill(
-                get_attn_backend(),
-                q,
-                None,
-                None,
-                m.attn_mha,
-                forward_batch,
-                packed_kv=k,
-            )
-    elif isinstance(k, MergedPrefixKVProjection):
+    if isinstance(k, MergedPrefixKVProjection):
         # Dedicated consumer for the opt-in merged prefix/current KV-B route.
         # RadixAttention's Tensor ``.view`` contract is bypassed only here; the
         # context was validated against this backend before prepare returned.

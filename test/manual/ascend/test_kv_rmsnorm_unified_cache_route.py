@@ -127,7 +127,6 @@ def run_site(monkeypatch, env_on, fia_nz=False, model=None, pool=None, dtype=tor
     monkeypatch.setattr(helper, "_invoke_new_op", invoke)
     monkeypatch.setattr(site, "get_token_to_kv_pool", lambda: pool)
     monkeypatch.setattr(site, "is_fia_nz", lambda: fia_nz)
-    monkeypatch.setattr(site, "can_fuse_expanded_kv", lambda *a, **kw: False)
     monkeypatch.setattr(torch_npu, "npu_interleave_rope", lambda x, c, s: x)
     monkeypatch.setattr(torch_npu, "npu_kv_rmsnorm_rope_cache", old_stub)
     fb = types.SimpleNamespace(out_cache_loc=idx)

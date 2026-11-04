@@ -118,10 +118,6 @@ class ForwardMetadata:
     # mapped block_tables for swa
     block_tables_swa: Optional[torch.Tensor] = None
 
-    # Eager-only FAS state. init_forward_metadata constructs a fresh
-    # ForwardMetadata each step; never place these in a global cache.
-    prefill_fas_decision: Optional[object] = None
-    prefill_fas_staging: Optional[object] = None
     # Eager dense-FAS per-step plan (fresh metadata per step; host-length key).
     dense_fas_plan: Optional[object] = None
     dense_fas_plan_key: Optional[object] = None
@@ -949,7 +945,6 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.use_mla
             and forward_batch.forward_mode.is_extend()
-            and getattr(self.token_to_kv_pool, "prefill_expanded_geometry", None) is None
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
@@ -1869,14 +1864,6 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
                 sinks=sinks,
             )
-
-        if getattr(self.token_to_kv_pool, "prefill_expanded_geometry", None) is not None:
-            from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
-                forward_expanded_prefill,
-            )
-
-            with torch.profiler.record_function("npu_prefill_expanded_kv"):
-                return forward_expanded_prefill(self, q, k, v, layer, forward_batch)
 
         if not self.use_mla:
             # Detect CP mode for prefill (context parallel)

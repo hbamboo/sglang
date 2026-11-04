@@ -705,7 +705,6 @@ class PrepareRouteContractTest(unittest.TestCase):
         self._old = {
             "get_attn_tp_context": mha.get_attn_tp_context,
             "get_token_to_kv_pool": mha.get_token_to_kv_pool,
-            "can_fuse_expanded_kv": mha.can_fuse_expanded_kv,
             "scattered_to_tp_attn_full": mha.scattered_to_tp_attn_full,
             "is_fia_nz": mha.is_fia_nz,
             "torch_npu": mha.torch_npu,
@@ -733,7 +732,6 @@ class PrepareRouteContractTest(unittest.TestCase):
     def tearDown(self):
         mha.get_attn_tp_context = self._old["get_attn_tp_context"]
         mha.get_token_to_kv_pool = self._old["get_token_to_kv_pool"]
-        mha.can_fuse_expanded_kv = self._old["can_fuse_expanded_kv"]
         mha.scattered_to_tp_attn_full = self._old["scattered_to_tp_attn_full"]
         mha.is_fia_nz = self._old["is_fia_nz"]
         mha.torch_npu = self._old["torch_npu"]
@@ -795,7 +793,6 @@ class PrepareRouteContractTest(unittest.TestCase):
             fetch_qkv_latent=lambda: self.qkv
         )
         mha.get_token_to_kv_pool = lambda: self.pool
-        mha.can_fuse_expanded_kv = lambda *args: False
         mha.scattered_to_tp_attn_full = lambda t, batch: t
         mha.is_fia_nz = lambda: False
 

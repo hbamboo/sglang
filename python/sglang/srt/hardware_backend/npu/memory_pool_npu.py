@@ -578,7 +578,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        prefill_expanded_geometry=None,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -594,10 +593,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
-
-        self.prefill_expanded_geometry = prefill_expanded_geometry
-        self.prefill_k_buffer = []
-        self.prefill_v_buffer = []
 
         self.custom_mem_pool = None
 
@@ -662,46 +657,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     device=self.device,
                 )
 
-        if prefill_expanded_geometry is not None:
-            geometry = prefill_expanded_geometry
-            shape = (self.size // self.page_size + 1, self.page_size, geometry.heads)
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                for _ in range(self.layer_num):
-                    self.prefill_k_buffer.append(
-                        torch.empty(
-                            *shape, geometry.key_dim, dtype=self.dtype, device=self.device
-                        )
-                    )
-                    self.prefill_v_buffer.append(
-                        torch.empty(
-                            *shape, geometry.value_dim, dtype=self.dtype, device=self.device
-                        )
-                    )
-
         self._finalize_allocation_log(size)
-
-    def get_prefill_expanded_kv(self, layer_id):
-        local_layer_id = layer_id - self.start_layer
-        return self.prefill_k_buffer[local_layer_id], self.prefill_v_buffer[local_layer_id]
-
-    def set_prefill_expanded_kv(self, layer_id, loc, key, value):
-        geometry = self.prefill_expanded_geometry
-        key_cache, value_cache = self.get_prefill_expanded_kv(layer_id)
-        if envs.SGLANG_NPU_PREFILL_FUSED_KV_SCATTER.get():
-            from sgl_kernel_npu.scatter_pa_kv_cache import scatter_pa_kv_cache
-
-            scatter_pa_kv_cache(key, key_cache, loc, value, value_cache)
-            return
-        indices = loc.to(dtype=torch.int64).view(-1, 1)
-        for cache, rows, dim in (
-            (key_cache, key, geometry.key_dim),
-            (value_cache, value, geometry.value_dim),
-        ):
-            torch_npu.npu_scatter_nd_update_(
-                cache.view(-1, geometry.heads, dim),
-                indices,
-                rows.reshape(-1, geometry.heads, dim).contiguous(),
-            )
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -711,8 +667,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(k_cache)
         for v_cache in self.v_buffer:
             kv_size_bytes += get_tensor_size_bytes(v_cache)
-        for cache in self.prefill_k_buffer + self.prefill_v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(cache)
         if self.index_head_dim is not None:
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:

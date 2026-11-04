@@ -1,11 +1,5 @@
 """Opt-in dense FAS for eager GLM prefill on the latent (non-expanded) KV path.
 
-``SGLANG_NPU_PREFILL_FAS=1`` historically drives the expanded-KV prefill route,
-which stages K/V through ``get_prefill_expanded_kv`` and two ``index_select``
-gathers.  This module lets the same public ``torch_npu.npu_fusion_attention``
-(TND, sparse mode 3) run directly on the already-dense tensors of the latent
-route, with ``expandKV=0``:
-
 * cold/no-prefix ordinary MHA core: the current ``q/k/v`` materialised by the
   existing prepare and cache writer;
 * merged prefix/current KV-B route: ``context.k_full`` / ``context.v_full`` are

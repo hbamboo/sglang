@@ -280,7 +280,6 @@ def real_load_and_final_process(cfg, quant_config, layer, ckpt):
 
 def install_prepare_fixture(attn):
     attn_mod.get_token_to_kv_pool = lambda: T.DummyPool()
-    attn_mod.can_fuse_expanded_kv = lambda *args, **kwargs: False
     attn_mod.is_fia_nz = lambda: False
     import sglang.srt.model_executor.forward_context as fctx
 

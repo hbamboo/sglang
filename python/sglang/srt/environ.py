@@ -752,17 +752,11 @@ class Envs:
     # decode on Ascend 950PR/950DT.  Also switches the NPU MLA KV pool to one
     # contiguous 576-wide latent buffer (see flash_mla_adapter.py).
     ENABLE_ASCEND_FLASH_MLA = EnvBool(False)
-    # Default on for supported dense NPU MLA PD prefill. Other workers retain
-    # latent KV; set to 0 to disable the expanded cache on supported workers.
-    SGLANG_NPU_PREFILL_EXPANDED_KV = EnvBool(True)
-    # Fuse packed MLA K/V assembly and paged writes; requires updated sgl-kernel-npu.
-    SGLANG_NPU_PREFILL_FUSED_KV_SCATTER = EnvBool(True)
     # Opt-in: statically split kv_b_proj into per-head K_nope/V matrices for the
     # current-token NPU MHA prepare. Off by default; unquantized BF16/FP16 only.
     SGLANG_NPU_SPLIT_KV_B_PROJ = EnvBool(False)
-    # Eager FAS candidate for guarded large expanded PD-prefill batches.
+    # Eager dense FAS for supported latent KV PD-prefill batches.
     SGLANG_NPU_PREFILL_FAS = EnvBool(False)
-    SGLANG_NPU_PREFILL_FAS_EXTENDED_SHAPES = EnvBool(False)
     # Retire ready previous PD-prefill output before submitting the next batch.
     SGLANG_NPU_PD_PREFILL_EARLY_RESULT = EnvBool(False)
     # Reuse existing MXFP8 once before top-k expansion on measured large PD prefill.

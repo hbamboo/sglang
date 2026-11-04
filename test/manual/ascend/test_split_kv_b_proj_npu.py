@@ -919,7 +919,6 @@ def loader_integration(metrics):
 def main():
     os.environ["SGLANG_NPU_SPLIT_KV_B_PROJ"] = "1"
     attn_mod.get_token_to_kv_pool = lambda: DummyPool()
-    attn_mod.can_fuse_expanded_kv = lambda *args, **kwargs: False
     import sglang.srt.model_executor.forward_context as fctx
 
     fctx.get_token_to_kv_pool = lambda: DummyPool()

@@ -48,7 +48,6 @@ FORMAL_TIMING = os.environ.get("SPLIT_KV_FORMAL_TIMING", "0") == "1"
 
 def setup_runtime():
     T.attn_mod.get_token_to_kv_pool = lambda: T.DummyPool()
-    T.attn_mod.can_fuse_expanded_kv = lambda *args, **kwargs: False
     import sglang.srt.model_executor.forward_context as fctx
 
     fctx.get_token_to_kv_pool = lambda: T.DummyPool()

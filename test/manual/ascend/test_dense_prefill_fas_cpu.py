@@ -382,9 +382,7 @@ def test_core_dispatch_keeps_gate_and_oproj():
     def build(fas_result):
         ns = {
             "torch": torch,
-            "PackedExpandedKV": Marker,
             "MergedPrefixKVProjection": Marker,
-            "forward_expanded_prefill": lambda *a, **k: None,
             "get_attn_backend": lambda: object(),
             "maybe_forward_dense_prefill_fas": lambda *a, **k: fas_result,
             "Optional": Optional,

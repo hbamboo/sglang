@@ -236,7 +236,6 @@ class TestPrefillNormContract(unittest.TestCase):
             "get_token_to_kv_pool": lambda: SimpleNamespace(get_kv_buffer=lambda layer: (Tensor(), Tensor())),
             "torch_npu": SimpleNamespace(npu_interleave_rope=lambda x, *args: x, npu_kv_rmsnorm_rope_cache=lambda *args, **kwargs: (None, None, Tensor(), Tensor())),
             "is_fia_nz": lambda: False,
-            "can_fuse_expanded_kv": lambda *args: False,
         }
         prepare = load(MHA, "forward_mha_prepare_npu", ns)
         batch = SimpleNamespace(out_cache_loc=Tensor())

@@ -1450,12 +1450,6 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
-        from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
-            get_prefill_expanded_geometry,
-        )
-
-        prefill_expanded_geometry = get_prefill_expanded_geometry(self)
-
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1463,7 +1457,6 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
-            prefill_expanded_geometry=prefill_expanded_geometry,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

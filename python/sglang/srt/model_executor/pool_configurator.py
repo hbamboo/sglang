@@ -185,7 +185,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
-        self._expanded_prefill_kv = False
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         self._transient_prefill_reserve_bytes = _npu_prefill_transient_reserve_bytes(
             kvc
@@ -284,13 +283,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
 
-        from sglang.srt.hardware_backend.npu.attention.prefill_expanded_kv import (
-            get_prefill_expanded_geometry,
-        )
-
-        expanded_geometry = get_prefill_expanded_geometry(kvc)
-        self._expanded_prefill_kv = expanded_geometry is not None
-
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -304,10 +296,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
-            if expanded_geometry is not None:
-                # Both latent (PD transfer) and expanded (P attention) caches
-                # share token slots and must fit the same memory budget.
-                cell_size += expanded_geometry.width * effective_num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -462,9 +450,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         reserve_bytes = getattr(self, "_transient_prefill_reserve_bytes", 0)
         available_bytes -= reserve_bytes
-        if getattr(self, "_expanded_prefill_kv", False):
-            # NPU pools allocate one extra physical page for the dummy slot.
-            available_bytes -= self._cell_size * page_size
         if reserve_bytes and available_bytes < self._cell_size * page_size:
             raise RuntimeError("NPU prefill transient reservation leaves less than one KV page")
         max_total_num_tokens = (
