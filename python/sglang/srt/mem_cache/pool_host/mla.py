@@ -644,12 +644,3 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
-
-
-def get_mla_host_pool_cls(device_pool) -> type:
-    """Select the host pool matching the device's physical MLA layout."""
-    if str(device_pool.device).split(":")[0] == "npu":
-        from sglang.srt.mem_cache.pool_host.npu import NPUMLATokenToKVPoolHost
-
-        return NPUMLATokenToKVPoolHost
-    return MLATokenToKVPoolHost

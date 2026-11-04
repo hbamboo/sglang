@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
-from sglang.srt.mem_cache.pool_host.mla import get_mla_host_pool_cls
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -107,7 +107,7 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
 
             _parallel = get_parallel()
-            self.token_to_kv_pool_host = get_mla_host_pool_cls(self.kv_cache)(
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 get_memory().hicache_ratio,
                 get_memory().hicache_size,

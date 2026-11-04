@@ -2,9 +2,6 @@
 
 from dataclasses import dataclass
 from functools import lru_cache
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -77,7 +74,7 @@ def get_prefill_expanded_geometry(kvc):
 
     from sglang.srt.configs.model_config import is_deepseek_dsa
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_disagg, get_parallel
+    from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 
     flag = envs.SGLANG_NPU_PREFILL_EXPANDED_KV
     if not flag.get():
@@ -91,12 +88,13 @@ def get_prefill_expanded_geometry(kvc):
         and get_parallel().attn_dcp_size == 1
         and get_parallel().attn_cp_size == 1
         and kvc.spec_algorithm.is_none()
+        and not get_memory().enable_hierarchical_cache
     )
     if not supported:
         if flag.is_set():
             raise ValueError(
                 "SGLANG_NPU_PREFILL_EXPANDED_KV requires dense NPU MLA PD prefill, "
-                "BF16/FP16 KV, CP=1, and no speculation"
+                "BF16/FP16 KV, CP=1, and no speculation or hierarchical cache"
             )
         return None
     try:
@@ -126,18 +124,6 @@ def forward_expanded_prefill(backend, q, k, v, layer, forward_batch, *, packed_k
     if tokens == 0:
         return query.new_zeros((query.shape[0], layer.tp_q_head_num * layer.v_head_dim))
     has_prefix = any(forward_batch.extend_prefix_lens_cpu)
-    if (
-        getattr(pool, "_hicache_expanded_host_mirror", False)
-        and not getattr(backend, "_hicache_expanded_prefill_logged", False)
-    ):
-        logger.info(
-            "Ascend HiCache expanded prefill active: "
-            "layer=%d tokens=%d prefix_tokens=%d",
-            layer.layer_id,
-            tokens,
-            sum(forward_batch.extend_prefix_lens_cpu),
-        )
-        backend._hicache_expanded_prefill_logged = True
     if packed_kv is None:
         pool.set_prefill_expanded_kv(
             layer.layer_id,
