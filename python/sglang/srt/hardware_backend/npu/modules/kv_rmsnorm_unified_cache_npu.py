@@ -8,7 +8,7 @@ results back (two whole-pool ``Slice`` + two whole-pool ``ViewCopy`` kernels),
 which costs ~1.5 ms per layer for a 7194x128 pool regardless of token count.
 
 This helper instead hands the real unified ``[pages, 128, 1, 576]`` (or packed
-``[rows, 1, 576]``) layer view to ``torch.ops.npu.kv_rmsnorm_unified_cache``,
+``[rows, 1, 576]``) layer view to ``torch.ops.npu.kv_rmsnorm_rope_cache``,
 which writes latent at ``slot*576`` and rope at ``slot*576+512`` for the
 touched slots only.  The view's ``data_ptr`` already includes the layer storage
 offset, so no layer arithmetic against the raw pool is performed.
@@ -48,7 +48,7 @@ from typing import Optional, Tuple
 import torch
 
 _ENV = "SGLANG_NPU_KV_RMSNORM_UNIFIED_CACHE"
-_OP_NAME = "kv_rmsnorm_unified_cache"
+_OP_NAME = "kv_rmsnorm_rope_cache"
 _KV_LATENT = 512
 _KV_ROPE = 64
 _KV_WIDTH = 576
@@ -145,7 +145,7 @@ def unified_layer_cache_view(pool, layer_id: int):
 
 def _invoke_new_op(kv4, gamma, cos, sin, index, cache, k_out, v_out, epsilon):
     """Single dispatch point so tests can observe that the new route was chosen."""
-    torch.ops.npu.kv_rmsnorm_unified_cache(kv4, gamma, cos, sin, index, cache, k_out, v_out, epsilon)
+    getattr(torch.ops.npu, _OP_NAME)(kv4, gamma, cos, sin, index, cache, k_out, v_out, epsilon)
 
 
 def maybe_unified_kv_rmsnorm_rope_cache(
